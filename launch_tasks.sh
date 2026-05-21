@@ -48,12 +48,12 @@ done
 
 # ── Launch ─────────────────────────────────────────────────────────────────
 tmux new-session -d -s "refine_guo_readmission" \
-    "export CUDA_VISIBLE_DEVICES=0; \
+    "export CUDA_VISIBLE_DEVICES=0; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
      bash '${REPO}/run_task_pipeline.sh' guo_readmission \
      2>&1 | tee '${REPO}/data/logs/guo_readmission.log'"
 
 tmux new-session -d -s "refine_guo_los" \
-    "export CUDA_VISIBLE_DEVICES=0; \
+    "export CUDA_VISIBLE_DEVICES=0; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
      bash '${REPO}/run_task_pipeline.sh' guo_los \
      2>&1 | tee '${REPO}/data/logs/guo_los.log'"
 

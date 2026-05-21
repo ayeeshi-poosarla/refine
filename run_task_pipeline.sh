@@ -63,6 +63,7 @@ python3 "$REPO/01_serialize/serialize.py" \
     --mode naivetext \
     --tasks "$TASK" \
     --patient_ids_file "$SELECTED_DIR/${TASK}_selected_patients.json" \
+    --workers 6 \
     --skip_existing
 
 # ── Step 3: Create naivetext SFT ────────────────────────────────────────────
@@ -85,7 +86,8 @@ log "=== Step 4: Generate naivetext embeddings (GPU) ==="
         --sft_dir "$SFT_NAIVE" \
         --output_dir "$EMB_NAIVE" \
         --tasks "$TASK" \
-        --splits train val test
+        --splits train val test \
+        --batch_size 2
     log "  [GPU lock released]"
 ) 200>"$GPU_LOCK"
 
@@ -129,7 +131,8 @@ log "=== Step 9: Generate rubric embeddings (GPU) ==="
         --sft_dir "$SFT_RUBRIC" \
         --output_dir "$EMB_RUBRIC" \
         --tasks "$TASK" \
-        --splits train val test
+        --splits train val test \
+        --batch_size 2
     log "  [GPU lock released]"
 ) 200>"$GPU_LOCK"
 

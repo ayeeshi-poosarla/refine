@@ -44,6 +44,7 @@ import json
 import csv
 import random
 import collections
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -248,6 +249,8 @@ def parse_args():
                        "When provided the EHRSHOT split assignments are overridden "
                        "with these custom splits, and cohort balancing is skipped."
                    ))
+    p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
+                   help="Parallel workers for serialization (default: min(8, cpu_count))")
     p.add_argument("--force", action="store_true")
     p.add_argument("--skip_existing", action="store_true",
                    help="Skip tasks that already have train.json, val.json, test.json")
@@ -358,7 +361,23 @@ def main():
         for task_records in collection.values()
         for records in task_records.values()
     )
-    logger.info(f"Serializing {to_serialize} records (after capping)")
+    logger.info(f"Serializing {to_serialize} records (after capping) with {args.workers} workers")
+
+    def _serialize_record(job):
+        _db, _ont, _r, _na, _tok, _max, _noclip = job
+        label_time = _r["prediction_time"]
+        text = serialize_patient(_db, _ont, _r["patient_id"], label_time, _na)
+        if _noclip:
+            orig_tokens, clipped_text, was_clipped = -1, text, False
+        else:
+            clipped_text, orig_tokens, was_clipped = clip_text(text, _tok, _max)
+        return {
+            **_r,
+            "prediction_time": label_time.isoformat(),
+            "serialization": clipped_text,
+            "original_tokens": orig_tokens,
+            "was_clipped": was_clipped,
+        }
 
     done = 0
     clipped_n = 0
@@ -369,37 +388,25 @@ def main():
             records = collection[task].get(split, [])
             if not records:
                 continue
-            for r in records:
-                label_time = r["prediction_time"]
-                text = serialize_patient(
-                    database, ontology, r["patient_id"], label_time, num_aggregated
-                )
-                if args.no_clip:
-                    # Skip slow tokenizer.encode on long texts; use -1 to indicate not computed
-                    orig_tokens = -1
-                    clipped_text, was_clipped = text, False
-                else:
-                    clipped_text, orig_tokens, was_clipped = clip_text(
-                        text, tokenizer, args.max_tokens
-                    )  # tokenizer is not None when not no_clip
-                if was_clipped:
-                    clipped_n += 1
-                r["prediction_time"] = label_time.isoformat()
-                r["serialization"] = clipped_text
-                r["original_tokens"] = orig_tokens
-                r["was_clipped"] = was_clipped
-                done += 1
-                if done % 500 == 0:
-                    logger.info(f"  {done}/{to_serialize} serialized (clipped so far: {clipped_n})")
+            jobs = [
+                (database, ontology, r, num_aggregated, tokenizer,
+                 args.max_tokens, args.no_clip)
+                for r in records
+            ]
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                serialized = list(executor.map(_serialize_record, jobs))
+            done += len(serialized)
+            clipped_n += sum(1 for r in serialized if r["was_clipped"])
+            logger.info(f"  {done}/{to_serialize} serialized (clipped so far: {clipped_n})")
 
             out_path = os.path.join(task_dir, f"{split}.json")
             with open(out_path, "w") as f:
-                json.dump(records, f, indent=2)
+                json.dump(serialized, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            pos = sum(1 for r in records if r["label"])
-            neg = len(records) - pos
-            logger.info(f"  {task}/{split}: {len(records)} saved (pos={pos}, neg={neg}) => {out_path}")
+            pos = sum(1 for r in serialized if r["label"])
+            neg = len(serialized) - pos
+            logger.info(f"  {task}/{split}: {len(serialized)} saved (pos={pos}, neg={neg}) => {out_path}")
 
         logger.info(f"  Task {task} complete - outputs in {task_dir} (ready for inspection)")
 
