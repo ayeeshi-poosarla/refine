@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Generate task-specific rubric instructions using GPT-5-mini.
+Generate task-specific rubric instructions using Gemini 2.5 Flash.
 
 For each task, this script:
   1. Loads the 40-patient cohort (from build_cohort.py).
   2. Formats examples with their ground-truth labels.
-  3. Prompts GPT-5-mini to produce a step-by-step rubric template.
+  3. Prompts Gemini 2.5 Flash to produce a step-by-step rubric template.
   4. Saves the rubric JSON.
 
 Inputs:
@@ -16,7 +16,7 @@ Inputs:
 Outputs:
   {output_dir}/{task}/rubric.json
 
-GPT-5-mini parameters: max_completion_tokens=16384, temperature=1.
+Requires: GOOGLE_API_KEY environment variable.
 
 Connects to:
   - Upstream  : build_cohort.py
@@ -32,11 +32,12 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from loguru import logger
-from openai import AzureOpenAI
+from google import genai
+from google.genai import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.tasks import TASKS, ALL_TASK_NAMES, SEED
-from config.azure import AzureConfig
+from config.gemini import GeminiConfig
 
 
 def _format_example(example: dict, task_query: str) -> str:
@@ -100,31 +101,30 @@ Output ONLY the rubric template itself -- the instructions another model will fo
 
 
 def generate_rubric(task: str, examples: List[dict],
-                    task_query: str, config: AzureConfig) -> Dict[str, Any]:
-    client = AzureOpenAI(
-        api_version=config.api_version,
-        azure_endpoint=config.endpoint,
-        api_key=config.api_key,
-    )
+                    task_query: str, config: GeminiConfig) -> Dict[str, Any]:
+    client = genai.Client(api_key=config.api_key)
     prompt = _build_prompt(task, examples, task_query)
     logger.info(f"  prompt length: {len(prompt)} chars")
 
-    resp = client.chat.completions.create(
-        model=config.deployment,
-        messages=[
-            {"role": "system",
-             "content": ("You are a medical expert AI assistant specializing in "
-                         "creating structured clinical evaluation rubrics.")},
-            {"role": "user", "content": prompt},
-        ],
-        max_completion_tokens=config.max_completion_tokens,
-        temperature=config.temperature,
+    resp = client.models.generate_content(
+        model=config.model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "You are a medical expert AI assistant specializing in "
+                "creating structured clinical evaluation rubrics."
+            ),
+            max_output_tokens=config.max_output_tokens,
+            temperature=config.temperature,
+        ),
     )
-    text = resp.choices[0].message.content.strip()
-    usage = {
-        "prompt_tokens": resp.usage.prompt_tokens if resp.usage else None,
-        "completion_tokens": resp.usage.completion_tokens if resp.usage else None,
-    }
+    text = resp.text.strip()
+    usage = {}
+    if resp.usage_metadata:
+        usage = {
+            "prompt_tokens": resp.usage_metadata.prompt_token_count,
+            "completion_tokens": resp.usage_metadata.candidates_token_count,
+        }
     logger.info(f"  rubric generated ({usage.get('completion_tokens', '?')} completion tokens)")
     return {
         "task": task,
@@ -144,17 +144,14 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cohort_dir", required=True)
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--azure_config", default=None)
     p.add_argument("--tasks", nargs="+", default=ALL_TASK_NAMES)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    config = AzureConfig.from_json(args.azure_config)
-    # Rubric creation benefits from lower temperature than application:
-    # we want a structured, deterministic template, not creative variation.
-    config.max_completion_tokens = 16384
+    config = GeminiConfig.from_env()
+    config.max_output_tokens = 16384
     config.temperature = 1.0
 
     for task in args.tasks:

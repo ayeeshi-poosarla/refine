@@ -241,6 +241,13 @@ def parse_args():
                    help="Do not clip serializations to max_tokens; use full text as-is")
     p.add_argument("--no_balance", action="store_true",
                    help="Skip cohort balancing; serialize all available records.")
+    p.add_argument("--patient_ids_file", default=None,
+                   help=(
+                       "JSON file produced by select_patients.py. "
+                       "Each entry is {\"patient_id\": int, \"split\": str}. "
+                       "When provided the EHRSHOT split assignments are overridden "
+                       "with these custom splits, and cohort balancing is skipped."
+                   ))
     p.add_argument("--force", action="store_true")
     p.add_argument("--skip_existing", action="store_true",
                    help="Skip tasks that already have train.json, val.json, test.json")
@@ -280,8 +287,32 @@ def main():
 
     # Load splits & labels (from per-task labeled_patients.csv files)
     patient_to_split = load_splits(args.path_to_splits)
+
+    # Override splits with custom patient selection if provided
+    custom_patient_ids = None
+    if args.patient_ids_file:
+        with open(args.patient_ids_file) as f:
+            patient_data = json.load(f)
+        if patient_data and isinstance(patient_data[0], dict):
+            # [{patient_id: int, split: str}, ...] — override splits
+            custom_splits = {int(d["patient_id"]): d["split"] for d in patient_data}
+            patient_to_split.update(custom_splits)
+            custom_patient_ids = set(custom_splits.keys())
+        else:
+            # [int, ...] — keep EHRSHOT splits, just filter
+            custom_patient_ids = {int(pid) for pid in patient_data}
+        logger.info(
+            f"--patient_ids_file: restricting to {len(custom_patient_ids)} patients "
+            f"(balancing disabled)"
+        )
+
     logger.info(f"Loading labels from {args.path_to_labels_dir} ...")
     patients_to_labels = load_labels(args.path_to_labels_dir, task_set)
+    if custom_patient_ids is not None:
+        patients_to_labels = {
+            pid: labels for pid, labels in patients_to_labels.items()
+            if pid in custom_patient_ids
+        }
     logger.info(f"Loaded {len(patient_to_split)} splits, "
                 f"{len(patients_to_labels)} patients with labels")
 
@@ -309,7 +340,7 @@ def main():
             if records:
                 before = len(records)
                 n_pos = sum(1 for r in records if r["label"])
-                if args.no_balance:
+                if args.no_balance or custom_patient_ids is not None:
                     logger.info(f"  {task}/{split}: {before} records kept (no balancing)  [pos={n_pos}]")
                 else:
                     collection[task][split] = balance_split(records, split)

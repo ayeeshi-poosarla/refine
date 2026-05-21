@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Apply a task-specific rubric to every patient's naivetext EHR via GPT-5-mini.
+Apply a task-specific rubric to every patient EHR via Gemini 2.5 Flash batch inference.
 
 For each task, this script:
   1. Loads the rubric instructions (from create_rubric.py).
-  2. Loads serialized patient records (from 01_serialize naivetext).
-  3. Sends each patient's EHR + rubric to GPT-5-mini.
-  4. Saves the rubricified text per patient (incremental, resumable).
+  2. Loads serialized patient records for the requested splits.
+  3. Submits all records as a single Gemini inline batch job.
+  4. Polls until complete, then saves rubricified JSONs per split.
+
+Inline batch: requests are passed directly as list[InlinedRequest]; responses
+come back in the same order via batch.dest.inlined_responses. No GCS or file
+upload required.
 
 Inputs:
   --rubric_dir     : Directory with {task}/rubric.json.
@@ -14,14 +18,13 @@ Inputs:
   --output_dir     : Where to write rubricified JSONs.
   --tasks          : Space-separated list (default: all 15).
   --splits         : Which splits to process (default: train val test).
-  --max_workers    : Parallel threads for API calls (default: 8).
 
 Outputs:
   {output_dir}/{task}/{split}.json
   Each record has: patient_id, prediction_time, task, split, label,
-                   rubricified_text (the GPT-5-mini output).
+                   rubricified_text.
 
-GPT-5-mini parameters: max_completion_tokens=16384, temperature=1.
+Requires: GOOGLE_API_KEY environment variable.
 
 Connects to:
   - Upstream  : create_rubric.py, 01_serialize (naivetext)
@@ -32,26 +35,32 @@ import argparse
 import json
 import os
 import sys
-import threading
 import time
-import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Tuple
 
 from loguru import logger
-from openai import AzureOpenAI, RateLimitError
+from google import genai
+from google.genai import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.tasks import TASKS, ALL_TASK_NAMES
-from config.azure import AzureConfig
+from config.gemini import GeminiConfig
 
-# Project root (ehrshot-v2); used to resolve relative dir paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+SYSTEM_PROMPT = (
+    "You are a medical expert AI assistant specializing in "
+    "structured clinical evaluation."
+)
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
 
 def _build_transform_prompt(ehr_text: str, rubric_instructions: str,
-                            task_query: str) -> str:
+                             task_query: str) -> str:
     return f"""You are a medical data extraction specialist. Your job is to read a patient's EHR and fill in a structured rubric template.
 
 ## Task
@@ -76,60 +85,11 @@ Fill in every field of the rubric template above using ONLY information from thi
 Rubric output:"""
 
 
-def _transform_one(record: dict, rubric_text: str, task_query: str,
-                   config: AzureConfig, max_retries: int = 5) -> Dict[str, Any]:
-    client = AzureOpenAI(
-        api_version=config.api_version,
-        azure_endpoint=config.endpoint,
-        api_key=config.api_key,
-    )
-    prompt = _build_transform_prompt(
-        record["serialization"], rubric_text, task_query)
+# ---------------------------------------------------------------------------
+# Resumability helpers
+# ---------------------------------------------------------------------------
 
-    for attempt in range(max_retries):
-        try:
-            resp = client.chat.completions.create(
-                model=config.deployment,
-                messages=[
-                    {"role": "system",
-                     "content": ("You are a medical expert AI assistant specializing "
-                                 "in structured clinical evaluation.")},
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=config.max_completion_tokens,
-                temperature=config.temperature,
-            )
-            text = resp.choices[0].message.content
-            if text and text.strip():
-                return {
-                    "patient_id": record["patient_id"],
-                    "prediction_time": record["prediction_time"],
-                    "task": record["task"],
-                    "split": record["split"],
-                    "label": record["label"],
-                    "rubricified_text": text.strip(),
-                }
-        except RateLimitError:
-            delay = (2 ** attempt) + random.uniform(0, 1)
-            logger.warning(f"Rate limit (patient {record['patient_id']}), "
-                           f"retry in {delay:.1f}s")
-            time.sleep(delay)
-        except Exception as e:
-            logger.error(f"Error for patient {record['patient_id']}: {e}")
-            break
-
-    # Fallback
-    return {
-        "patient_id": record["patient_id"],
-        "prediction_time": record["prediction_time"],
-        "task": record["task"],
-        "split": record["split"],
-        "label": record["label"],
-        "rubricified_text": "[ERROR: transformation failed]",
-    }
-
-
-def _load_done_keys(path: Path) -> Set:
+def _load_done_keys(path: Path) -> set:
     if not path.exists():
         return set()
     try:
@@ -140,23 +100,189 @@ def _load_done_keys(path: Path) -> Set:
         return set()
 
 
-def _save_incremental(entry: dict, path: Path, lock: threading.Lock):
-    with lock:
-        data = []
-        if path.exists():
+def _load_existing(path: Path) -> list:
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Core batch routine
+# ---------------------------------------------------------------------------
+
+def apply_rubric_batch(
+    task: str,
+    splits: List[str],
+    rubric_dir: Path,
+    serialized_dir: Path,
+    output_dir: Path,
+    config: GeminiConfig,
+) -> None:
+    rubric_path = rubric_dir / task / "rubric.json"
+    if not rubric_path.exists():
+        logger.warning(f"No rubric for {task} at {rubric_path}, skipping")
+        return
+
+    with open(rubric_path) as f:
+        rubric_data = json.load(f)
+    rubric_text = rubric_data["rubric_instructions"]
+    task_query = TASKS[task]
+
+    # ---- Collect todo records across all splits ----
+    # order_index maps position in flat list → (split, original record)
+    order_index: List[Tuple[str, dict]] = []
+
+    for split in splits:
+        src = serialized_dir / task / f"{split}.json"
+        if not src.exists():
+            logger.warning(f"  {task}/{split}: no serialized file at {src}, skipping")
+            continue
+        with open(src) as f:
+            records = json.load(f)
+
+        out_path = output_dir / task / f"{split}.json"
+        done = _load_done_keys(out_path)
+        todo = [
+            r for r in records
+            if (r["patient_id"], r["prediction_time"]) not in done
+        ]
+        if not todo:
+            logger.info(f"  {task}/{split}: already complete ({len(done)} done)")
+        else:
+            logger.info(
+                f"  {task}/{split}: {len(todo)} to rubricify "
+                f"({len(done)} already done)"
+            )
+        for r in todo:
+            order_index.append((split, r))
+
+    if not order_index:
+        logger.info(f"  {task}: nothing to do")
+        return
+
+    logger.info(f"  {task}: submitting {len(order_index)} requests as inline batch")
+
+    # ---- Build InlinedRequest list ----
+    inlined_requests = []
+    for split, record in order_index:
+        prompt = _build_transform_prompt(
+            record["serialization"], rubric_text, task_query
+        )
+        inlined_requests.append(
+            types.InlinedRequest(
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=config.max_output_tokens,
+                    temperature=config.temperature,
+                ),
+            )
+        )
+
+    # ---- Submit batch ----
+    client = genai.Client(api_key=config.api_key)
+    batch = client.batches.create(
+        model=config.model,
+        src=inlined_requests,
+        config=types.CreateBatchJobConfig(
+            display_name=f"refine-rubric-{task}",
+        ),
+    )
+    logger.info(f"  batch job created: {batch.name}  state={batch.state.name}")
+
+    # ---- Poll ----
+    poll_interval = 60
+    elapsed = 0
+    while not batch.done:
+        logger.info(
+            f"  [{elapsed//60}m] state={batch.state.name} — "
+            f"waiting {poll_interval}s ..."
+        )
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        batch = client.batches.get(name=batch.name)
+
+    if batch.state.name != "JOB_STATE_SUCCEEDED":
+        err = getattr(batch, "error", None)
+        raise RuntimeError(
+            f"Batch job {batch.name} ended with state {batch.state.name}. "
+            f"Error: {err}"
+        )
+
+    logger.info(f"  batch complete: {batch.name}")
+
+    # ---- Parse inline responses ----
+    responses = batch.dest.inlined_responses
+    if responses is None:
+        raise RuntimeError(
+            f"batch.dest.inlined_responses is None for job {batch.name}. "
+            "Check the Gemini API batch documentation for this SDK version."
+        )
+
+    if len(responses) != len(order_index):
+        logger.warning(
+            f"  response count mismatch: got {len(responses)}, "
+            f"expected {len(order_index)}"
+        )
+
+    # Accumulate results per split
+    new_by_split: Dict[str, List[dict]] = {s: [] for s in splits}
+    error_count = 0
+
+    for i, (inlined_resp, (split, record)) in enumerate(
+        zip(responses, order_index)
+    ):
+        if inlined_resp.error:
+            text = f"[ERROR: {inlined_resp.error}]"
+            error_count += 1
+        else:
             try:
-                with open(path) as f:
-                    data = json.load(f)
-            except Exception:
-                pass
-        data.append(entry)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+                text = inlined_resp.response.candidates[0].content.parts[0].text.strip()
+            except Exception as e:
+                text = f"[ERROR: could not extract text — {e}]"
+                error_count += 1
+
+        new_by_split[split].append({
+            "patient_id": record["patient_id"],
+            "prediction_time": record["prediction_time"],
+            "task": record["task"],
+            "split": split,
+            "label": record["label"],
+            "rubricified_text": text,
+        })
+
+    if error_count:
+        logger.warning(f"  {error_count}/{len(order_index)} responses had errors")
+
+    # ---- Save per-split JSONs (merge with any already-done records) ----
+    for split in splits:
+        if not new_by_split.get(split):
+            continue
+        out_path = output_dir / task / f"{split}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = _load_existing(out_path)
+        all_results = existing + new_by_split[split]
+        with open(out_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+        pos = sum(1 for r in all_results if r["label"])
+        logger.info(
+            f"  saved {task}/{split}: {len(all_results)} total "
+            f"(pos={pos}, neg={len(all_results)-pos}) -> {out_path}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _resolve_dir(path_str: str) -> Path:
+    p = Path(path_str)
+    return p.resolve() if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
@@ -166,65 +292,23 @@ def parse_args():
     p.add_argument("--output_dir", required=True)
     p.add_argument("--tasks", nargs="+", default=ALL_TASK_NAMES)
     p.add_argument("--splits", nargs="+", default=["train", "val", "test"])
-    p.add_argument("--max_workers", type=int, default=20)
-    p.add_argument("--azure_config", default=None)
     return p.parse_args()
-
-
-def _resolve_dir(path_str: str) -> Path:
-    """Resolve to absolute path; if relative, interpret relative to project root."""
-    p = Path(path_str)
-    return p.resolve() if p.is_absolute() else (PROJECT_ROOT / p).resolve()
 
 
 def main():
     args = parse_args()
+    config = GeminiConfig.from_env()
     rubric_dir = _resolve_dir(args.rubric_dir)
     serialized_dir = _resolve_dir(args.serialized_dir)
     output_dir = _resolve_dir(args.output_dir)
 
-    config = AzureConfig.from_json(args.azure_config)
-    config.max_completion_tokens = 16384
-    config.temperature = 1.0
-    lock = threading.Lock()
-
-    for split in args.splits:
-        logger.info(f"=== Split: {split} ===")
-        for task in args.tasks:
-            rubric_path = rubric_dir / task / "rubric.json"
-            if not rubric_path.exists():
-                logger.warning(f"No rubric for {task}, skipping")
-                continue
-            with open(rubric_path) as f:
-                rubric_text = json.load(f)["rubric_instructions"]
-
-            src = serialized_dir / task / f"{split}.json"
-            if not src.exists():
-                continue
-            with open(src) as f:
-                records = json.load(f)
-
-            out_path = output_dir / task / f"{split}.json"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            done = _load_done_keys(out_path)
-            todo = [r for r in records
-                    if (r["patient_id"], r["prediction_time"]) not in done]
-            logger.info(f"  {task}/{split}: {len(todo)} to do "
-                       f"({len(done)} already done)")
-            if not todo:
-                continue
-
-            with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
-                futs = {
-                    pool.submit(_transform_one, r, rubric_text,
-                                TASKS[task], config): r
-                    for r in todo
-                }
-                for fut in as_completed(futs):
-                    result = fut.result()
-                    _save_incremental(result, out_path, lock)
-
-            logger.info(f"  {task}/{split} done -> {out_path}")
+    for task in args.tasks:
+        logger.info(f"\n{'='*60}\nApplying rubric for: {task}\n{'='*60}")
+        apply_rubric_batch(
+            task, args.splits,
+            rubric_dir, serialized_dir, output_dir,
+            config,
+        )
 
     logger.success("All rubric transformations complete.")
 
