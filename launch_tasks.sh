@@ -24,25 +24,20 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Pre-flight ─────────────────────────────────────────────────────────────
-if [ -z "${GOOGLE_API_KEY:-}" ]; then
-    echo "ERROR: GOOGLE_API_KEY is not set."
-    echo ""
-    echo "How to find your key:"
-    echo "  1. Go to https://aistudio.google.com/apikey"
-    echo "  2. Sign in with the Google account used for your Gemini projects"
-    echo "  3. Copy the key for an existing project (or create a new one)"
-    echo "  4. Run:  export GOOGLE_API_KEY=<your_key>"
-    echo "  5. Then re-run this script"
-    exit 1
-fi
-
 python3 -c "
 import torch
 if torch.cuda.is_available():
-    print(f'[GPU] {torch.cuda.get_device_name(0)} (CUDA available)')
+    print(f'[GPU] {torch.cuda.get_device_name(0)} (CUDA available — shared via GPU lock)')
 else:
     print('[WARNING] CUDA not available — embedding steps will run on CPU')
 "
+
+# Verify ADC works
+python3 -c "
+import vertexai
+vertexai.init(project='som-nero-plevriti-deidbdf', location='us-central1')
+print('[AUTH] Vertex AI ADC OK (project=som-nero-plevriti-deidbdf)')
+" || { echo 'ERROR: Vertex AI ADC check failed. Run: gcloud auth application-default login'; exit 1; }
 
 mkdir -p "$REPO/data/logs"
 
@@ -52,15 +47,13 @@ for SESSION in refine_guo_readmission refine_guo_los; do
 done
 
 # ── Launch ─────────────────────────────────────────────────────────────────
-KEY="$GOOGLE_API_KEY"
-
 tmux new-session -d -s "refine_guo_readmission" \
-    "export GOOGLE_API_KEY='${KEY}'; export CUDA_VISIBLE_DEVICES=0; \
+    "export CUDA_VISIBLE_DEVICES=0; \
      bash '${REPO}/run_task_pipeline.sh' guo_readmission \
      2>&1 | tee '${REPO}/data/logs/guo_readmission.log'"
 
 tmux new-session -d -s "refine_guo_los" \
-    "export GOOGLE_API_KEY='${KEY}'; export CUDA_VISIBLE_DEVICES=0; \
+    "export CUDA_VISIBLE_DEVICES=0; \
      bash '${REPO}/run_task_pipeline.sh' guo_los \
      2>&1 | tee '${REPO}/data/logs/guo_los.log'"
 

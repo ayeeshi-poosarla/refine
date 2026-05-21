@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Apply a task-specific rubric to every patient EHR via Gemini 2.5 Flash batch inference.
+Apply a task-specific rubric to every patient EHR via Gemini 2.5 Flash
+Vertex AI batch prediction.
 
 For each task, this script:
   1. Loads the rubric instructions (from create_rubric.py).
   2. Loads serialized patient records for the requested splits.
-  3. Submits all records as a single Gemini inline batch job.
-  4. Polls until complete, then saves rubricified JSONs per split.
+  3. Uploads a JSONL request file to GCS.
+  4. Submits a Vertex AI BatchPredictionJob and polls until complete.
+  5. Downloads the output JSONL from GCS and saves rubricified JSONs per split.
 
-Inline batch: requests are passed directly as list[InlinedRequest]; responses
-come back in the same order via batch.dest.inlined_responses. No GCS or file
-upload required.
+Each request carries a _meta field ({patient_id, prediction_time, split, label,
+task}) that is preserved in the Vertex AI output for result-to-record matching.
+
+Authentication: Application Default Credentials (ADC) — automatic on this GCP VM.
 
 Inputs:
   --rubric_dir     : Directory with {task}/rubric.json.
@@ -24,8 +27,6 @@ Outputs:
   Each record has: patient_id, prediction_time, task, split, label,
                    rubricified_text.
 
-Requires: GOOGLE_API_KEY environment variable.
-
 Connects to:
   - Upstream  : create_rubric.py, 01_serialize (naivetext)
   - Downstream: create_globalrubric_sft.py
@@ -37,11 +38,12 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
+import vertexai
+from google.cloud import storage
 from loguru import logger
-from google import genai
-from google.genai import types
+from vertexai.batch_prediction import BatchPredictionJob
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.tasks import TASKS, ALL_TASK_NAMES
@@ -83,6 +85,16 @@ Fill in every field of the rubric template above using ONLY information from thi
 - Do NOT include any information not found in the EHR above.
 
 Rubric output:"""
+
+
+# ---------------------------------------------------------------------------
+# GCS helpers
+# ---------------------------------------------------------------------------
+
+def _parse_gcs_uri(uri: str) -> Tuple[str, str]:
+    s = uri.replace("gs://", "", 1)
+    bucket, _, prefix = s.partition("/")
+    return bucket, prefix
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +145,7 @@ def apply_rubric_batch(
     task_query = TASKS[task]
 
     # ---- Collect todo records across all splits ----
-    # order_index maps position in flat list → (split, original record)
     order_index: List[Tuple[str, dict]] = []
-
     for split in splits:
         src = serialized_dir / task / f"{split}.json"
         if not src.exists():
@@ -164,108 +174,138 @@ def apply_rubric_batch(
         logger.info(f"  {task}: nothing to do")
         return
 
-    logger.info(f"  {task}: submitting {len(order_index)} requests as inline batch")
+    logger.info(f"  {task}: building {len(order_index)} batch requests")
 
-    # ---- Build InlinedRequest list ----
-    inlined_requests = []
+    # ---- Build JSONL ----
+    timestamp = int(time.time())
+    requests_jsonl: List[str] = []
     for split, record in order_index:
         prompt = _build_transform_prompt(
             record["serialization"], rubric_text, task_query
         )
-        inlined_requests.append(
-            types.InlinedRequest(
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=config.max_output_tokens,
-                    temperature=config.temperature,
-                ),
-            )
-        )
+        meta = {
+            "patient_id": record["patient_id"],
+            "prediction_time": record["prediction_time"],
+            "split": split,
+            "label": record["label"],
+            "task": task,
+        }
+        row = {
+            "request": {
+                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": config.temperature,
+                    "maxOutputTokens": config.max_output_tokens,
+                },
+            },
+            "_meta": json.dumps(meta),
+        }
+        requests_jsonl.append(json.dumps(row))
 
-    # ---- Submit batch ----
-    client = genai.Client(api_key=config.api_key)
-    batch = client.batches.create(
-        model=config.model,
-        src=inlined_requests,
-        config=types.CreateBatchJobConfig(
-            display_name=f"refine-rubric-{task}",
-        ),
+    # ---- Upload JSONL to GCS ----
+    in_uri = (
+        f"gs://{config.gcs_bucket}/{config.gcs_prefix}/"
+        f"input/refine_rubric_{task}_{timestamp}.jsonl"
     )
-    logger.info(f"  batch job created: {batch.name}  state={batch.state.name}")
+    out_prefix = (
+        f"gs://{config.gcs_bucket}/{config.gcs_prefix}/"
+        f"output/refine_rubric_{task}_{timestamp}"
+    )
+
+    storage_client = storage.Client()
+    in_bucket_name, in_blob_path = _parse_gcs_uri(in_uri)
+    storage_client.bucket(in_bucket_name).blob(in_blob_path).upload_from_string(
+        "\n".join(requests_jsonl).encode("utf-8"),
+        content_type="application/jsonl",
+    )
+    logger.info(f"  uploaded {len(order_index)} requests to {in_uri}")
+
+    # ---- Submit Vertex AI batch job ----
+    vertexai.init(project=config.project, location=config.location)
+    job = BatchPredictionJob.submit(
+        source_model=config.model,
+        input_dataset=in_uri,
+        output_uri_prefix=out_prefix,
+        job_display_name=f"refine-rubric-{task}-{timestamp}",
+    )
+    logger.info(f"  batch job submitted: {job.resource_name}")
 
     # ---- Poll ----
     poll_interval = 60
     elapsed = 0
-    while not batch.done:
+    while not job.has_ended:
         logger.info(
-            f"  [{elapsed//60}m] state={batch.state.name} — "
-            f"waiting {poll_interval}s ..."
+            f"  [{elapsed//60}m] state={job.state} — waiting {poll_interval}s ..."
         )
         time.sleep(poll_interval)
         elapsed += poll_interval
-        batch = client.batches.get(name=batch.name)
+        job.refresh()
 
-    if batch.state.name != "JOB_STATE_SUCCEEDED":
-        err = getattr(batch, "error", None)
+    if not job.has_succeeded:
         raise RuntimeError(
-            f"Batch job {batch.name} ended with state {batch.state.name}. "
-            f"Error: {err}"
+            f"Batch job {job.resource_name} failed: {job.error}"
         )
+    logger.info(f"  batch complete — output at {job.output_location}")
 
-    logger.info(f"  batch complete: {batch.name}")
-
-    # ---- Parse inline responses ----
-    responses = batch.dest.inlined_responses
-    if responses is None:
-        raise RuntimeError(
-            f"batch.dest.inlined_responses is None for job {batch.name}. "
-            "Check the Gemini API batch documentation for this SDK version."
+    # ---- Download and parse output JSONL from GCS ----
+    out_bucket_name, out_blob_prefix = _parse_gcs_uri(job.output_location)
+    blobs = [
+        b for b in storage_client.bucket(out_bucket_name).list_blobs(
+            prefix=out_blob_prefix
         )
+        if b.name.endswith(".jsonl")
+    ]
+    logger.info(f"  found {len(blobs)} output JSONL blob(s)")
 
-    if len(responses) != len(order_index):
-        logger.warning(
-            f"  response count mismatch: got {len(responses)}, "
-            f"expected {len(order_index)}"
-        )
-
-    # Accumulate results per split
     new_by_split: Dict[str, List[dict]] = {s: [] for s in splits}
     error_count = 0
 
-    for i, (inlined_resp, (split, record)) in enumerate(
-        zip(responses, order_index)
-    ):
-        if inlined_resp.error:
-            text = f"[ERROR: {inlined_resp.error}]"
-            error_count += 1
-        else:
+    for blob in blobs:
+        for line in blob.download_as_text().splitlines():
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+
+            # Skip errored rows
+            if obj.get("status") not in ("", None):
+                error_count += 1
+                logger.warning(f"  row error: {obj.get('status')}")
+                continue
+
+            meta_raw = obj.get("_meta", "{}")
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
+            split = meta.get("split", "unknown")
+
             try:
-                text = inlined_resp.response.candidates[0].content.parts[0].text.strip()
+                text = (
+                    obj["response"]["candidates"][0]["content"]["parts"][0]["text"]
+                    .strip()
+                )
             except Exception as e:
                 text = f"[ERROR: could not extract text — {e}]"
                 error_count += 1
 
-        new_by_split[split].append({
-            "patient_id": record["patient_id"],
-            "prediction_time": record["prediction_time"],
-            "task": record["task"],
-            "split": split,
-            "label": record["label"],
-            "rubricified_text": text,
-        })
+            new_by_split.setdefault(split, []).append({
+                "patient_id": meta["patient_id"],
+                "prediction_time": meta["prediction_time"],
+                "task": meta["task"],
+                "split": split,
+                "label": meta["label"],
+                "rubricified_text": text,
+            })
 
     if error_count:
-        logger.warning(f"  {error_count}/{len(order_index)} responses had errors")
+        logger.warning(f"  {error_count} responses had errors")
 
     # ---- Save per-split JSONs (merge with any already-done records) ----
-    for split in splits:
-        if not new_by_split.get(split):
+    for split, new_results in new_by_split.items():
+        if not new_results:
             continue
         out_path = output_dir / task / f"{split}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         existing = _load_existing(out_path)
-        all_results = existing + new_by_split[split]
+        all_results = existing + new_results
         with open(out_path, "w") as f:
             json.dump(all_results, f, indent=2)
         pos = sum(1 for r in all_results if r["label"])
@@ -297,7 +337,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = GeminiConfig.from_env()
+    config = GeminiConfig.default()
     rubric_dir = _resolve_dir(args.rubric_dir)
     serialized_dir = _resolve_dir(args.serialized_dir)
     output_dir = _resolve_dir(args.output_dir)

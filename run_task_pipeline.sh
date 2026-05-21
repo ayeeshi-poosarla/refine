@@ -5,7 +5,7 @@
 #   CUDA_VISIBLE_DEVICES=0 bash run_task_pipeline.sh guo_readmission
 #
 # Prerequisites:
-#   export GOOGLE_API_KEY=your_key_here
+# Authentication via Application Default Credentials (ADC) — automatic on GCP VM.
 #
 # GPU steps (embedding generation) use a file lock at /tmp/refine_gpu.lock
 # so two parallel tmux sessions share the single A100 without OOM.
@@ -38,13 +38,6 @@ mkdir -p "$DATA/logs"
 log() { echo "[$(date '+%H:%M:%S')] [$TASK] $*"; }
 
 # ── Pre-flight checks ──────────────────────────────────────────────────────
-if [ -z "${GOOGLE_API_KEY:-}" ]; then
-    echo "ERROR: GOOGLE_API_KEY is not set."
-    echo "  export GOOGLE_API_KEY=your_key_here"
-    echo "  Find it at: https://aistudio.google.com/apikey"
-    exit 1
-fi
-
 python3 - <<'PYCHECK'
 import torch
 if torch.cuda.is_available():

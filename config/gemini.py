@@ -1,6 +1,8 @@
-"""Gemini API configuration for REFINE pipeline."""
+"""Vertex AI / Gemini configuration for REFINE pipeline.
 
-import os
+Uses Application Default Credentials (ADC) — no API key needed on this GCP VM.
+"""
+
 from dataclasses import dataclass
 
 
@@ -9,19 +11,12 @@ class GeminiConfig:
     model: str = "gemini-2.5-flash"
     temperature: float = 1.0
     max_output_tokens: int = 16384
+    project: str = "som-nero-plevriti-deidbdf"
+    location: str = "us-central1"
+    # GCS bucket used for Vertex AI batch input/output
+    gcs_bucket: str = "vista_bench"
+    gcs_prefix: str = "temp/pinnacle_templated_summaries"
 
     @classmethod
-    def from_env(cls, **overrides) -> "GeminiConfig":
-        key = os.environ.get("GOOGLE_API_KEY", "")
-        if not key:
-            raise EnvironmentError(
-                "GOOGLE_API_KEY is not set.\n"
-                "Export it before running:\n"
-                "  export GOOGLE_API_KEY=your_key_here\n"
-                "Find your key at: https://aistudio.google.com/apikey"
-            )
+    def default(cls, **overrides) -> "GeminiConfig":
         return cls(**overrides)
-
-    @property
-    def api_key(self) -> str:
-        return os.environ["GOOGLE_API_KEY"]

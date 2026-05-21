@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate task-specific rubric instructions using Gemini 2.5 Flash.
+Generate task-specific rubric instructions using Gemini 2.5 Flash via Vertex AI.
 
 For each task, this script:
   1. Loads the 40-patient cohort (from build_cohort.py).
   2. Formats examples with their ground-truth labels.
   3. Prompts Gemini 2.5 Flash to produce a step-by-step rubric template.
   4. Saves the rubric JSON.
+
+Authentication: Application Default Credentials (ADC) — works automatically
+on this GCP VM via the compute service account.
 
 Inputs:
   --cohort_dir  : Directory with {task}/cohort.json files.
@@ -15,8 +18,6 @@ Inputs:
 
 Outputs:
   {output_dir}/{task}/rubric.json
-
-Requires: GOOGLE_API_KEY environment variable.
 
 Connects to:
   - Upstream  : build_cohort.py
@@ -31,9 +32,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-from loguru import logger
+import vertexai
 from google import genai
 from google.genai import types
+from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.tasks import TASKS, ALL_TASK_NAMES, SEED
@@ -102,7 +104,11 @@ Output ONLY the rubric template itself -- the instructions another model will fo
 
 def generate_rubric(task: str, examples: List[dict],
                     task_query: str, config: GeminiConfig) -> Dict[str, Any]:
-    client = genai.Client(api_key=config.api_key)
+    client = genai.Client(
+        vertexai=True,
+        project=config.project,
+        location=config.location,
+    )
     prompt = _build_prompt(task, examples, task_query)
     logger.info(f"  prompt length: {len(prompt)} chars")
 
@@ -150,9 +156,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = GeminiConfig.from_env()
-    config.max_output_tokens = 16384
-    config.temperature = 1.0
+    config = GeminiConfig.default()
 
     for task in args.tasks:
         logger.info(f"\n{'='*60}\nCreating rubric for: {task}\n{'='*60}")
