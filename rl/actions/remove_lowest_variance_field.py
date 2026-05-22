@@ -24,6 +24,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from rl.base_action import BaseAction
+from rl.state import RubricState
+
 SPLITS = ("train", "val", "test")
 FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 
@@ -62,6 +65,39 @@ def remove_field_from_text(rubricified_text: str, field: str) -> str:
     return pattern.sub("", rubricified_text)
 
 
+class RemoveLowestVarianceField(BaseAction):
+    @property
+    def name(self) -> str:
+        return "remove_lowest_variance_field"
+
+    def apply(self, state: RubricState) -> RubricState:
+        new_state = state.copy()
+
+        # Compute unique counts from in-memory records
+        field_values: dict[str, set] = defaultdict(set)
+        for recs in new_state.records.values():
+            for r in recs:
+                for field, value in FIELD_RE.findall(r["rubricified_text"]):
+                    field_values[field].add(value.strip())
+        unique_counts = {f: len(v) for f, v in field_values.items()}
+
+        target = find_lowest_variance_field(unique_counts)
+
+        new_state.rubric["rubric_instructions"] = remove_field_from_rubric(
+            new_state.rubric["rubric_instructions"], target
+        )
+        for recs in new_state.records.values():
+            for r in recs:
+                r["rubricified_text"] = remove_field_from_text(r["rubricified_text"], target)
+
+        new_state.rubric["_last_action"] = {
+            "action": self.name,
+            "removed_field": target,
+            "unique_values": unique_counts[target],
+        }
+        return new_state
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -73,45 +109,21 @@ def main():
     rubric_dir = Path(args.rubric_dir)
     rubricified_dir = Path(args.rubricified_dir)
 
-    # 1. Identify the lowest-variance field
-    unique_counts = compute_unique_counts(rubricified_dir, args.task)
-    if not unique_counts:
+    state = RubricState.from_disk(args.task, rubric_dir, rubricified_dir)
+    if not state.records:
         print(f"ERROR: no rubricified records found for {args.task}", file=sys.stderr)
         sys.exit(1)
 
-    target = find_lowest_variance_field(unique_counts)
-    print(f"Lowest variance field: {target} ({unique_counts[target]} unique value(s))")
+    action = RemoveLowestVarianceField()
+    new_state = action.apply(state)
 
-    # 2. Remove from rubric template
-    rubric_path = rubric_dir / args.task / "rubric.json"
-    rubric = json.load(open(rubric_path))
-    before = rubric["rubric_instructions"]
-    rubric["rubric_instructions"] = remove_field_from_rubric(before, target)
-    if rubric["rubric_instructions"] == before:
-        print(f"WARNING: field {target} not found in rubric_instructions — template unchanged")
-    else:
-        print(f"Removed {target} from rubric template")
-    with open(rubric_path, "w") as f:
-        json.dump(rubric, f, indent=2)
+    meta = new_state.rubric.get("_last_action", {})
+    print(f"Lowest variance field: {meta.get('removed_field')} ({meta.get('unique_values')} unique value(s))")
+    for split, recs in new_state.records.items():
+        print(f"  {split}: {len(recs)} records updated")
 
-    # 3. Remove from every filled rubric record
-    total_modified = 0
-    for split in SPLITS:
-        path = rubricified_dir / args.task / f"{split}.json"
-        if not path.exists():
-            continue
-        records = json.load(open(path))
-        for r in records:
-            new_text = remove_field_from_text(r["rubricified_text"], target)
-            if new_text != r["rubricified_text"]:
-                r["rubricified_text"] = new_text
-                total_modified += 1
-        with open(path, "w") as f:
-            json.dump(records, f, indent=2)
-        print(f"  {split}: {len(records)} records updated")
-
-    print(f"Done. Removed '{target}' from {total_modified} rubricified records.")
-    return {"removed_field": target, "unique_values": unique_counts[target]}
+    new_state.to_disk(rubric_dir, rubricified_dir)
+    print(f"Done. Removed '{meta.get('removed_field')}' and saved to disk.")
 
 
 if __name__ == "__main__":

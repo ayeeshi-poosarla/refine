@@ -7,8 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from actions.add_missingness_indicator import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+from rl.actions.add_missingness_indicator import (
     add_field_to_rubric,
     add_field_to_text,
     compute_missing_rates,
@@ -132,14 +132,15 @@ def test_end_to_end_adds_missingness_field():
         with open(d / "rubric.json", "w") as f:
             json.dump(rubric, f)
 
-        import subprocess
+        import subprocess, os
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
         result = subprocess.run(
             [sys.executable,
              str(Path(__file__).resolve().parents[1] / "actions" / "add_missingness_indicator.py"),
              "--task", task,
              "--rubric_dir", str(rub_tmp),
              "--rubricified_dir", str(rubricified_tmp)],
-            capture_output=True, text=True
+            capture_output=True, text=True, env=env
         )
         assert result.returncode == 0, f"Script failed:\n{result.stderr}"
 

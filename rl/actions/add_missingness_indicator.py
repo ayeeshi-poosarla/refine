@@ -30,6 +30,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from rl.base_action import BaseAction
+from rl.state import RubricState
+
 SPLITS  = ("train", "val", "test")
 FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 MISSING_VALUES = {"None", "N/A", "No data"}
@@ -83,6 +86,47 @@ def add_field_to_text(rubricified_text: str, source_field: str,
     return pattern.sub(replace, rubricified_text, count=1)
 
 
+class AddMissingnessIndicator(BaseAction):
+    @property
+    def name(self) -> str:
+        return "add_missingness_indicator"
+
+    def apply(self, state: RubricState) -> RubricState:
+        new_state = state.copy()
+
+        # Compute missing rates from in-memory records
+        field_missing: dict[str, int] = defaultdict(int)
+        field_total:   dict[str, int] = defaultdict(int)
+        for recs in new_state.records.values():
+            for r in recs:
+                for field, value in FIELD_RE.findall(r["rubricified_text"]):
+                    field_total[field] += 1
+                    if value.strip() in MISSING_VALUES:
+                        field_missing[field] += 1
+        rates = {f: (field_missing[f], field_total[f]) for f in field_total}
+
+        source_field = find_highest_missing_field(rates)
+        n_missing, n_total = rates[source_field]
+        new_field = f"{source_field}_IS_MISSING"
+
+        new_state.rubric["rubric_instructions"] = add_field_to_rubric(
+            new_state.rubric["rubric_instructions"], source_field, new_field
+        )
+        for recs in new_state.records.values():
+            for r in recs:
+                r["rubricified_text"] = add_field_to_text(
+                    r["rubricified_text"], source_field, new_field
+                )
+
+        new_state.rubric["_last_action"] = {
+            "action": self.name,
+            "source_field": source_field,
+            "new_field": new_field,
+            "missing_pct": n_missing / n_total * 100 if n_total else 0,
+        }
+        return new_state
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -94,48 +138,22 @@ def main():
     rubric_dir      = Path(args.rubric_dir)
     rubricified_dir = Path(args.rubricified_dir)
 
-    # 1. Find field with highest missing rate
-    rates = compute_missing_rates(rubricified_dir, args.task)
-    if not rates:
+    state = RubricState.from_disk(args.task, rubric_dir, rubricified_dir)
+    if not state.records:
         print(f"ERROR: no rubricified records found for {args.task}", file=sys.stderr)
         sys.exit(1)
 
-    source_field = find_highest_missing_field(rates)
-    n_missing, n_total = rates[source_field]
-    new_field = f"{source_field}_IS_MISSING"
-    pct = n_missing / n_total * 100
-    print(f"Highest missing rate field: {source_field} ({pct:.1f}% missing, {n_missing}/{n_total})")
-    print(f"New field: {new_field}")
+    action = AddMissingnessIndicator()
+    new_state = action.apply(state)
 
-    # 2. Update rubric template
-    rubric_path = rubric_dir / args.task / "rubric.json"
-    rubric = json.load(open(rubric_path))
-    rubric["rubric_instructions"] = add_field_to_rubric(
-        rubric["rubric_instructions"], source_field, new_field
-    )
-    with open(rubric_path, "w") as f:
-        json.dump(rubric, f, indent=2)
-    print(f"Updated rubric template: inserted {new_field} after {source_field}")
+    meta = new_state.rubric.get("_last_action", {})
+    print(f"Highest missing rate field: {meta.get('source_field')} ({meta.get('missing_pct', 0):.1f}% missing)")
+    print(f"New field: {meta.get('new_field')}")
+    for split, recs in new_state.records.items():
+        print(f"  {split}: {len(recs)} records updated")
 
-    # 3. Update every filled rubric record
-    total_modified = 0
-    for split in SPLITS:
-        path = rubricified_dir / args.task / f"{split}.json"
-        if not path.exists():
-            continue
-        records = json.load(open(path))
-        for r in records:
-            r["rubricified_text"] = add_field_to_text(
-                r["rubricified_text"], source_field, new_field
-            )
-            total_modified += 1
-        with open(path, "w") as f:
-            json.dump(records, f, indent=2)
-        print(f"  {split}: {len(records)} records updated")
-
-    print(f"Done. Added '{new_field}' to {total_modified} records.")
-    return {"source_field": source_field, "new_field": new_field,
-            "missing_pct": pct}
+    new_state.to_disk(rubric_dir, rubricified_dir)
+    print(f"Done. Added '{meta.get('new_field')}' and saved to disk.")
 
 
 if __name__ == "__main__":

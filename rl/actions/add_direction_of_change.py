@@ -44,6 +44,9 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 
+from rl.base_action import BaseAction
+from rl.state import RubricState
+
 SPLITS = ("train", "val", "test")
 FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 NUM_RE   = re.compile(r'-?\d+\.?\d*')
@@ -174,6 +177,45 @@ def add_field_to_text(rubricified_text: str, source_field: str,
     return pattern.sub(replacement, rubricified_text, count=1)
 
 
+class AddDirectionOfChange(BaseAction):
+    @property
+    def name(self) -> str:
+        return "add_direction_of_change"
+
+    def apply(self, state: RubricState) -> RubricState:
+        new_state = state.copy()
+
+        if "train" not in new_state.records or "test" not in new_state.records:
+            raise ValueError("train and test splits required")
+
+        train_rows = parse_fields(new_state.records["train"])
+        test_rows  = parse_fields(new_state.records["test"])
+        aurocs = compute_individual_aurocs(train_rows, test_rows)
+        source_field = max(aurocs, key=lambda f: aurocs[f])
+        new_field = f"{source_field}_DIRECTION"
+
+        directions = compute_directions(new_state.records, source_field)
+
+        new_state.rubric["rubric_instructions"] = add_field_to_rubric(
+            new_state.rubric["rubric_instructions"], source_field, new_field
+        )
+        for recs in new_state.records.values():
+            for r in recs:
+                key = (r["patient_id"], r["prediction_time"])
+                direction = directions.get(key, "N/A")
+                r["rubricified_text"] = add_field_to_text(
+                    r["rubricified_text"], source_field, new_field, direction
+                )
+
+        new_state.rubric["_last_action"] = {
+            "action": self.name,
+            "source_field": source_field,
+            "new_field": new_field,
+            "auroc": aurocs[source_field],
+        }
+        return new_state
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -182,54 +224,25 @@ def main():
     p.add_argument("--rubricified_dir", required=True)
     args = p.parse_args()
 
-    rubric_dir     = Path(args.rubric_dir)
+    rubric_dir      = Path(args.rubric_dir)
     rubricified_dir = Path(args.rubricified_dir)
 
-    split_records = load_records(rubricified_dir, args.task)
-    if "train" not in split_records or "test" not in split_records:
+    state = RubricState.from_disk(args.task, rubric_dir, rubricified_dir)
+    if "train" not in state.records or "test" not in state.records:
         print("ERROR: train and test splits required", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Find highest individual AUROC field
-    train_rows = parse_fields(split_records["train"])
-    test_rows  = parse_fields(split_records["test"])
-    aurocs = compute_individual_aurocs(train_rows, test_rows)
-    source_field = max(aurocs, key=lambda f: aurocs[f])
-    new_field = f"{source_field}_DIRECTION"
-    print(f"Highest individual AUROC field: {source_field} (AUROC={aurocs[source_field]:.4f})")
-    print(f"New field: {new_field}")
+    action = AddDirectionOfChange()
+    new_state = action.apply(state)
 
-    # 2. Compute directions for all records
-    directions = compute_directions(split_records, source_field)
+    meta = new_state.rubric.get("_last_action", {})
+    print(f"Highest individual AUROC field: {meta.get('source_field')} (AUROC={meta.get('auroc', 0):.4f})")
+    print(f"New field: {meta.get('new_field')}")
+    for split, recs in new_state.records.items():
+        print(f"  {split}: {len(recs)} records updated")
 
-    # 3. Update rubric template
-    rubric_path = rubric_dir / args.task / "rubric.json"
-    rubric = json.load(open(rubric_path))
-    rubric["rubric_instructions"] = add_field_to_rubric(
-        rubric["rubric_instructions"], source_field, new_field
-    )
-    with open(rubric_path, "w") as f:
-        json.dump(rubric, f, indent=2)
-    print(f"Updated rubric template: inserted {new_field} after {source_field}")
-
-    # 4. Update every filled rubric record
-    total_modified = 0
-    for split, records in split_records.items():
-        for r in records:
-            key = (r["patient_id"], r["prediction_time"])
-            direction = directions.get(key, "N/A")
-            r["rubricified_text"] = add_field_to_text(
-                r["rubricified_text"], source_field, new_field, direction
-            )
-            total_modified += 1
-        path = rubricified_dir / args.task / f"{split}.json"
-        with open(path, "w") as f:
-            json.dump(records, f, indent=2)
-        print(f"  {split}: {len(records)} records updated")
-
-    print(f"Done. Added '{new_field}' to {total_modified} records.")
-    return {"source_field": source_field, "new_field": new_field,
-            "auroc": aurocs[source_field]}
+    new_state.to_disk(rubric_dir, rubricified_dir)
+    print(f"Done. Added '{meta.get('new_field')}' and saved to disk.")
 
 
 if __name__ == "__main__":

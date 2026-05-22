@@ -7,8 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from actions.remove_lowest_variance_field import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+from rl.actions.remove_lowest_variance_field import (
     compute_unique_counts,
     find_lowest_variance_field,
     remove_field_from_rubric,
@@ -121,14 +121,15 @@ def test_end_to_end_removes_field_from_all_records():
         write_rubric(rub_tmp, task, instructions)
 
         # Run via subprocess to use the same arg parsing as real usage
-        import subprocess
+        import subprocess, os
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
         result = subprocess.run(
             [sys.executable,
              str(Path(__file__).resolve().parents[1] / "actions" / "remove_lowest_variance_field.py"),
              "--task", task,
              "--rubric_dir", str(rub_tmp),
              "--rubricified_dir", str(rubricified_tmp)],
-            capture_output=True, text=True
+            capture_output=True, text=True, env=env
         )
         assert result.returncode == 0, f"Script failed:\n{result.stderr}"
         assert "CONSTANT" in result.stdout
