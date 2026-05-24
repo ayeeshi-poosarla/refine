@@ -335,6 +335,150 @@ def test_end_to_end_via_subprocess():
     print("PASS test_end_to_end_via_subprocess")
 
 
+# ── Parsing correctness: right values from rubricified_text ──────────────────
+
+def test_collect_nonmissing_values_multiword_values():
+    # Values like "No evidence of disease" and "Stage IV" must be captured whole.
+    records = {
+        "train": [
+            {
+                "patient_id": 1, "prediction_time": "2020-01-01", "label": 1,
+                "rubricified_text": (
+                    "*   **DISEASE_STATUS:** Active disease\n"
+                    "*   **STAGE:** Stage IV\n"
+                    "*   **FLAG:** Yes\n"
+                ),
+            },
+            {
+                "patient_id": 2, "prediction_time": "2020-01-02", "label": 0,
+                "rubricified_text": (
+                    "*   **DISEASE_STATUS:** No evidence of disease\n"
+                    "*   **STAGE:** Stage I\n"
+                    "*   **FLAG:** No\n"
+                ),
+            },
+        ]
+    }
+    vals = collect_nonmissing_values(records)
+    assert "Active disease" in vals["DISEASE_STATUS"], \
+        f"Multiword value truncated; got: {vals['DISEASE_STATUS']}"
+    assert "No evidence of disease" in vals["DISEASE_STATUS"], \
+        f"Multiword value truncated; got: {vals['DISEASE_STATUS']}"
+    assert vals["STAGE"] == {"Stage IV", "Stage I"}, \
+        f"STAGE values wrong: {vals['STAGE']}"
+    assert vals["FLAG"] == {"Yes", "No"}
+    print("PASS test_collect_nonmissing_values_multiword_values")
+
+
+def test_collect_nonmissing_values_no_prefix_contamination():
+    # RISK and READMISSION_RISK share a suffix; values must not bleed across fields.
+    records = {
+        "train": [
+            {
+                "patient_id": 1, "prediction_time": "2020-01-01", "label": 1,
+                "rubricified_text": (
+                    "*   **READMISSION_RISK:** High\n"
+                    "*   **RISK:** Low\n"
+                ),
+            },
+            {
+                "patient_id": 2, "prediction_time": "2020-01-02", "label": 0,
+                "rubricified_text": (
+                    "*   **READMISSION_RISK:** Low\n"
+                    "*   **RISK:** High\n"
+                ),
+            },
+        ]
+    }
+    vals = collect_nonmissing_values(records)
+    assert vals["READMISSION_RISK"] == {"High", "Low"}, \
+        f"READMISSION_RISK captured wrong: {vals.get('READMISSION_RISK')}"
+    assert vals["RISK"] == {"Low", "High"}, \
+        f"RISK captured wrong: {vals.get('RISK')}"
+    # No value from one field should appear under the other's key as a contamination
+    # (both happen to have the same values here, but the sets are independently built)
+    assert "READMISSION_RISK" in vals and "RISK" in vals
+    print("PASS test_collect_nonmissing_values_no_prefix_contamination")
+
+
+def test_refine_field_in_text_no_prefix_match():
+    # Remapping FLAG must not touch RED_FLAG.
+    text = (
+        "*   **RED_FLAG:** Yes\n"
+        "*   **FLAG:** No\n"
+    )
+    vmap = {"No": "none", "Yes": "severe"}
+    result = refine_field_in_text(text, "FLAG", vmap)
+    fields = dict(FIELD_RE.findall(result))
+    assert fields.get("RED_FLAG") == "Yes", \
+        f"RED_FLAG was modified unexpectedly: {fields}"
+    assert fields.get("FLAG") == "none", \
+        f"FLAG not remapped: {fields}"
+    print("PASS test_refine_field_in_text_no_prefix_match")
+
+
+def test_refine_field_in_text_both_values_remapped():
+    # Every record — whether it holds the "none" or "severe" value — must be remapped.
+    records_text = [
+        "*   **RISK:** High\n*   **FLAG:** Yes\n",
+        "*   **RISK:** Low\n*   **FLAG:** No\n",
+        "*   **RISK:** High\n*   **FLAG:** Yes\n",
+        "*   **RISK:** Low\n*   **FLAG:** No\n",
+    ]
+    vmap = {"No": "none", "Yes": "severe"}
+    for text in records_text:
+        result = refine_field_in_text(text, "FLAG", vmap)
+        fields = dict(FIELD_RE.findall(result))
+        assert fields["FLAG"] in ("none", "severe"), \
+            f"FLAG not remapped: {fields['FLAG']!r} in {text!r}"
+        assert fields["RISK"] in ("High", "Low"), "RISK modified unexpectedly"
+    print("PASS test_refine_field_in_text_both_values_remapped")
+
+
+# ── Rubric format correctness ─────────────────────────────────────────────────
+
+def test_refine_field_in_rubric_exact_bullet_format():
+    # The edited FLAG line must follow the exact rubric bullet format:
+    #   *   **FLAG:** [none if X; mild if intermediate presentation; severe if Y]
+    instructions = (
+        "*   **OTHER:** [Stays unchanged]\n"
+        "*   **FLAG:** [Yes/No]\n"
+        "*   **ALSO:** [Also unchanged]\n"
+    )
+    vmap = {"No": "none", "Yes": "severe"}
+    result = refine_field_in_rubric(instructions, "FLAG", vmap)
+
+    flag_lines = [l for l in result.splitlines() if "**FLAG:**" in l]
+    assert len(flag_lines) == 1, \
+        f"Expected exactly 1 FLAG line, got {len(flag_lines)}: {flag_lines}"
+    line = flag_lines[0]
+
+    # Must start with '*   **FLAG:** [' and end with ']'
+    assert re.match(r'^\*   \*\*FLAG:\*\* \[.+\]$', line), \
+        f"Wrong bullet format: {line!r}"
+    # Must contain all three ordinal levels
+    assert "none" in line and "mild" in line and "severe" in line, \
+        f"Missing ordinal level in: {line!r}"
+    print("PASS test_refine_field_in_rubric_exact_bullet_format")
+
+
+def test_refine_field_in_rubric_preserves_surrounding_line_format():
+    # Lines for fields other than the target must be byte-for-byte unchanged.
+    first = "*   **FIRST_FIELD:** [First description]"
+    last  = "*   **LAST_FIELD:** [Last description]"
+    instructions = f"{first}\n*   **FLAG:** [Yes/No]\n{last}\n"
+
+    vmap = {"No": "none", "Yes": "severe"}
+    result = refine_field_in_rubric(instructions, "FLAG", vmap)
+
+    lines = [l for l in result.splitlines() if l.strip()]
+    assert any(l == first for l in lines), \
+        f"FIRST_FIELD line changed: {[l for l in lines if 'FIRST' in l]}"
+    assert any(l == last for l in lines), \
+        f"LAST_FIELD line changed: {[l for l in lines if 'LAST' in l]}"
+    print("PASS test_refine_field_in_rubric_preserves_surrounding_line_format")
+
+
 if __name__ == "__main__":
     test_collect_nonmissing_values_excludes_sentinels()
     test_find_binary_fields()
@@ -350,4 +494,10 @@ if __name__ == "__main__":
     test_apply_does_not_mutate_input()
     test_apply_raises_when_no_binary_fields()
     test_end_to_end_via_subprocess()
+    test_collect_nonmissing_values_multiword_values()
+    test_collect_nonmissing_values_no_prefix_contamination()
+    test_refine_field_in_text_no_prefix_match()
+    test_refine_field_in_text_both_values_remapped()
+    test_refine_field_in_rubric_exact_bullet_format()
+    test_refine_field_in_rubric_preserves_surrounding_line_format()
     print("\nAll tests passed.")

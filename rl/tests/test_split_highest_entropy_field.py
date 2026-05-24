@@ -244,6 +244,124 @@ def test_end_to_end_via_subprocess():
     print("PASS test_end_to_end_via_subprocess")
 
 
+# ── Parsing correctness: right values from rubricified_text ──────────────────
+
+def test_collect_field_values_extracts_multiword_values():
+    # Values like "3 or more" and "Stage IV metastatic" must be captured whole,
+    # not truncated at the first space.
+    records = {
+        "train": [
+            {
+                "patient_id": 1, "prediction_time": "2020-01-01", "label": 1,
+                "rubricified_text": (
+                    "*   **STAGE:** Stage IV metastatic\n"
+                    "*   **PRIOR_ADMISSIONS:** 3 or more\n"
+                    "*   **RISK:** High\n"
+                ),
+            },
+            {
+                "patient_id": 2, "prediction_time": "2020-01-02", "label": 0,
+                "rubricified_text": (
+                    "*   **STAGE:** Stage I localized\n"
+                    "*   **PRIOR_ADMISSIONS:** None\n"
+                    "*   **RISK:** Low\n"
+                ),
+            },
+        ]
+    }
+    vals = collect_field_values(records)
+    assert "Stage IV metastatic" in vals["STAGE"], \
+        f"Multiword value truncated; got: {vals['STAGE']}"
+    assert "Stage I localized" in vals["STAGE"]
+    assert "3 or more" in vals["PRIOR_ADMISSIONS"], \
+        f"Multiword value truncated; got: {vals['PRIOR_ADMISSIONS']}"
+    assert "None" in vals["PRIOR_ADMISSIONS"]
+    assert "High" in vals["RISK"]
+    print("PASS test_collect_field_values_extracts_multiword_values")
+
+
+def test_collect_field_values_no_cross_field_contamination():
+    # RISK and READMISSION_RISK share a suffix; values must not bleed across fields.
+    records = {
+        "train": [
+            {
+                "patient_id": 1, "prediction_time": "2020-01-01", "label": 1,
+                "rubricified_text": (
+                    "*   **READMISSION_RISK:** High\n"
+                    "*   **RISK:** Low\n"
+                ),
+            },
+        ]
+    }
+    vals = collect_field_values(records)
+    assert vals.get("READMISSION_RISK") == ["High"], \
+        f"READMISSION_RISK captured wrong: {vals.get('READMISSION_RISK')}"
+    assert vals.get("RISK") == ["Low"], \
+        f"RISK captured wrong: {vals.get('RISK')}"
+    print("PASS test_collect_field_values_no_cross_field_contamination")
+
+
+def test_replace_field_in_text_no_prefix_match():
+    # Replacing RISK must not touch READMISSION_RISK.
+    text = (
+        "*   **READMISSION_RISK:** High\n"
+        "*   **RISK:** Medium\n"
+    )
+    result = replace_field_in_text(text, "RISK", "RISK_BIN", "LOW")
+    fields = dict(FIELD_RE.findall(result))
+    assert fields.get("READMISSION_RISK") == "High", \
+        f"READMISSION_RISK was modified: {fields}"
+    assert "RISK_BIN" in fields, f"RISK_BIN missing: {fields}"
+    assert fields["RISK_BIN"] == "LOW"
+    # Original RISK key must be gone (replaced by RISK_BIN)
+    assert "RISK" not in fields or fields.get("RISK") is None or \
+        all(k != "RISK" for k in fields if k != "READMISSION_RISK"), \
+        f"Original RISK still present: {fields}"
+    print("PASS test_replace_field_in_text_no_prefix_match")
+
+
+# ── Rubric format correctness ─────────────────────────────────────────────────
+
+def test_replace_field_in_rubric_exact_bullet_format():
+    # The new _BIN line must follow the exact rubric bullet format:
+    #   *   **FIELD_BIN:** [LOW if ...; HIGH if ...]
+    instructions = (
+        "*   **AGE:** [Patient age in years]\n"
+        "*   **RISK:** [Risk level]\n"
+        "*   **SEX:** [Male or Female]\n"
+    )
+    bin_map = {"Low": "LOW", "High": "HIGH"}
+    result = replace_field_in_rubric(instructions, "RISK", "RISK_BIN", bin_map)
+
+    risk_bin_lines = [l for l in result.splitlines() if "RISK_BIN" in l]
+    assert len(risk_bin_lines) == 1, \
+        f"Expected exactly 1 RISK_BIN line, got {len(risk_bin_lines)}: {risk_bin_lines}"
+    line = risk_bin_lines[0]
+
+    # Must start with '*   **', end with ']', contain LOW and HIGH
+    assert re.match(r'^\*   \*\*RISK_BIN:\*\* \[.+\]$', line), \
+        f"Wrong bullet format: {line!r}"
+    assert "LOW" in line and "HIGH" in line
+    print("PASS test_replace_field_in_rubric_exact_bullet_format")
+
+
+def test_replace_field_in_rubric_preserves_surrounding_line_format():
+    # Lines for fields other than the target must be byte-for-byte unchanged.
+    first = "*   **FIRST_FIELD:** [First description]"
+    last  = "*   **LAST_FIELD:** [Last description]"
+    instructions = f"{first}\n*   **TARGET:** [To replace]\n{last}\n"
+
+    bin_map = {"A": "LOW", "B": "HIGH"}
+    result = replace_field_in_rubric(instructions, "TARGET", "TARGET_BIN", bin_map)
+
+    lines = [l for l in result.splitlines() if l.strip()]
+    assert any(l == first for l in lines), \
+        f"FIRST_FIELD line changed: {[l for l in lines if 'FIRST' in l]}"
+    assert any(l == last for l in lines), \
+        f"LAST_FIELD line changed: {[l for l in lines if 'LAST' in l]}"
+    print("PASS test_replace_field_in_rubric_preserves_surrounding_line_format")
+
+
 if __name__ == "__main__":
     test_compute_entropy_uniform()
     test_compute_entropy_constant()
@@ -256,4 +374,9 @@ if __name__ == "__main__":
     test_apply_replaces_highest_entropy_field()
     test_apply_does_not_mutate_input()
     test_end_to_end_via_subprocess()
+    test_collect_field_values_extracts_multiword_values()
+    test_collect_field_values_no_cross_field_contamination()
+    test_replace_field_in_text_no_prefix_match()
+    test_replace_field_in_rubric_exact_bullet_format()
+    test_replace_field_in_rubric_preserves_surrounding_line_format()
     print("\nAll tests passed.")
