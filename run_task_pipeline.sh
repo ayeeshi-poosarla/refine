@@ -55,6 +55,10 @@ python3 "$REPO/select_patients.py" \
 
 # ── Step 2: Serialize EHRs (only selected patients, no balancing) ───────────
 log "=== Step 2: Serialize EHRs ==="
+SERIALIZE_EXTRA_ARGS=()
+if [[ "$TASK" == lab_* ]]; then
+    SERIALIZE_EXTRA_ARGS+=(--max_records_per_patient 1)
+fi
 python3 "$REPO/01_serialize/serialize.py" \
     --path_to_database "$DB" \
     --path_to_labels_dir "$LABELS" \
@@ -64,7 +68,8 @@ python3 "$REPO/01_serialize/serialize.py" \
     --tasks "$TASK" \
     --patient_ids_file "$SELECTED_DIR/${TASK}_selected_patients.json" \
     --workers 6 \
-    --skip_existing
+    --skip_existing \
+    "${SERIALIZE_EXTRA_ARGS[@]}"
 
 # ── Step 3: Create naivetext SFT ────────────────────────────────────────────
 log "=== Step 3: Create naivetext SFT ==="

@@ -167,6 +167,9 @@ def load_labels(labels_dir: str, task_names: set):
         with open(label_file) as f:
             for row in csv.DictReader(f):
                 pid = int(row["patient_id"])
+                # Skip ambiguous lab values (2 or 3) — only 0 (normal) and 1 (abnormal) are used
+                if task.startswith("lab_") and int(row["value"]) in {2, 3}:
+                    continue
                 pt_str = row["prediction_time"].replace(" ", "T")
                 t = datetime.fromisoformat(pt_str)
                 if t.second != 0:
@@ -251,6 +254,8 @@ def parse_args():
                    ))
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
                    help="Parallel workers for serialization (default: min(8, cpu_count))")
+    p.add_argument("--max_records_per_patient", type=int, default=None,
+                   help="Keep only the last N records per patient per split (by prediction_time)")
     p.add_argument("--force", action="store_true")
     p.add_argument("--skip_existing", action="store_true",
                    help="Skip tasks that already have train.json, val.json, test.json")
@@ -293,14 +298,19 @@ def main():
 
     # Override splits with custom patient selection if provided
     custom_patient_ids = None
+    custom_majority_labels: Dict[int, bool] = {}
     if args.patient_ids_file:
         with open(args.patient_ids_file) as f:
             patient_data = json.load(f)
         if patient_data and isinstance(patient_data[0], dict):
-            # [{patient_id: int, split: str}, ...] — override splits
+            # [{patient_id: int, split: str, label?: bool}, ...] — override splits
             custom_splits = {int(d["patient_id"]): d["split"] for d in patient_data}
             patient_to_split.update(custom_splits)
             custom_patient_ids = set(custom_splits.keys())
+            custom_majority_labels = {
+                int(d["patient_id"]): bool(d["label"])
+                for d in patient_data if "label" in d
+            }
         else:
             # [int, ...] — keep EHRSHOT splits, just filter
             custom_patient_ids = {int(pid) for pid in patient_data}
@@ -349,6 +359,28 @@ def main():
                     collection[task][split] = balance_split(records, split)
                     logger.info(f"  {task}/{split}: {before} -> {len(collection[task][split])} "
                                 f"(capped before serialization)  [pos={n_pos}]")
+
+    # Cap to N records per patient (keep latest event matching patient's majority label)
+    if args.max_records_per_patient:
+        for task in sorted(collection):
+            for split in ("train", "val", "test"):
+                records = collection[task].get(split, [])
+                if not records:
+                    continue
+                by_patient: Dict[int, dict] = {}
+                for r in sorted(records, key=lambda x: x["prediction_time"]):
+                    pid = r["patient_id"]
+                    majority = custom_majority_labels.get(pid)
+                    if majority is None:
+                        by_patient[pid] = r  # no label info: keep latest
+                    elif bool(r["label"]) == majority:
+                        by_patient[pid] = r  # keep latest event matching majority label
+                    elif pid not in by_patient:
+                        by_patient[pid] = r  # fallback if no matching event found
+                collection[task][split] = list(by_patient.values())
+                pos = sum(1 for r in by_patient.values() if r["label"])
+                logger.info(f"  {task}/{split}: capped to {args.max_records_per_patient} record/patient "
+                            f"-> {len(collection[task][split])} records [pos={pos}]")
 
     # Load database (only after we know what to serialize)
     logger.info(f"Loading FEMR database: {args.path_to_database}")

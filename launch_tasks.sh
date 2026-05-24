@@ -2,22 +2,21 @@
 # launch_tasks.sh — Start one tmux session per task.
 #
 # Usage:
-#   export GOOGLE_API_KEY=your_key_here
 #   bash launch_tasks.sh
 #
 # Sessions:
-#   refine_guo_readmission
-#   refine_guo_los
+#   refine_new_lupus
+#   refine_lab_hyperkalemia
 #
 # Both sessions share the single A100 (CUDA_VISIBLE_DEVICES=0).
 # GPU-heavy steps are serialized via /tmp/refine_gpu.lock.
 # Gemini API calls run in parallel across sessions.
 #
 # Monitor:
-#   tmux attach -t refine_guo_readmission
-#   tmux attach -t refine_guo_los
-#   tail -f data/logs/guo_readmission.log
-#   tail -f data/logs/guo_los.log
+#   tmux attach -t refine_new_lupus
+#   tmux attach -t refine_lab_hyperkalemia
+#   tail -f data/logs/new_lupus.log
+#   tail -f data/logs/lab_hyperkalemia.log
 
 set -euo pipefail
 
@@ -42,29 +41,29 @@ print('[AUTH] Vertex AI ADC OK (project=som-nero-plevriti-deidbdf)')
 mkdir -p "$REPO/data/logs"
 
 # Kill existing sessions with the same name
-for SESSION in refine_guo_readmission refine_guo_los; do
+for SESSION in refine_new_lupus refine_lab_hyperkalemia; do
     tmux kill-session -t "$SESSION" 2>/dev/null && echo "  killed existing session: $SESSION" || true
 done
 
 # ── Launch ─────────────────────────────────────────────────────────────────
-tmux new-session -d -s "refine_guo_readmission" \
+tmux new-session -d -s "refine_new_lupus" \
     "export CUDA_VISIBLE_DEVICES=0; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
-     bash '${REPO}/run_task_pipeline.sh' guo_readmission \
-     2>&1 | tee '${REPO}/data/logs/guo_readmission.log'"
+     bash '${REPO}/run_task_pipeline.sh' new_lupus \
+     2>&1 | tee '${REPO}/data/logs/new_lupus.log'"
 
-tmux new-session -d -s "refine_guo_los" \
+tmux new-session -d -s "refine_lab_hyperkalemia" \
     "export CUDA_VISIBLE_DEVICES=0; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
-     bash '${REPO}/run_task_pipeline.sh' guo_los \
-     2>&1 | tee '${REPO}/data/logs/guo_los.log'"
+     bash '${REPO}/run_task_pipeline.sh' lab_hyperkalemia \
+     2>&1 | tee '${REPO}/data/logs/lab_hyperkalemia.log'"
 
 echo ""
 echo "Started sessions:"
-echo "  tmux attach -t refine_guo_readmission"
-echo "  tmux attach -t refine_guo_los"
+echo "  tmux attach -t refine_new_lupus"
+echo "  tmux attach -t refine_lab_hyperkalemia"
 echo ""
 echo "Monitor logs:"
-echo "  tail -f ${REPO}/data/logs/guo_readmission.log"
-echo "  tail -f ${REPO}/data/logs/guo_los.log"
+echo "  tail -f ${REPO}/data/logs/new_lupus.log"
+echo "  tail -f ${REPO}/data/logs/lab_hyperkalemia.log"
 echo ""
 echo "Note: both sessions share GPU 0 via /tmp/refine_gpu.lock."
 echo "Gemini API calls run in parallel; embedding steps run one at a time."

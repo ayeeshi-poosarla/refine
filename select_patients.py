@@ -43,14 +43,23 @@ from config.tasks import SEED
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _majority_label(values: list) -> bool:
-    """True if more than half of prediction events are positive (ties → True)."""
-    n_true = sum(1 for v in values if v)
-    return n_true >= len(values) / 2
+def _is_pos_patient(task: str, raw_values: list) -> bool:
+    """True if the patient counts as positive for the given task.
+
+    lab_* : ever had value==1 (at least one positive event)
+    others: majority of boolean events are True (ties → True)
+    """
+    if task.startswith("lab_"):
+        return any(int(v) == 1 for v in raw_values)
+    n_true = sum(1 for v in raw_values if v.strip() == "True")
+    return n_true >= len(raw_values) / 2
 
 
-def _parse_bool(raw: str) -> bool:
-    return raw.strip() == "True"
+def _has_ambiguous_labels(task: str, raw_values: list) -> bool:
+    """For lab tasks, True if the patient has any value of 2 or 3 (exclude these patients)."""
+    if task.startswith("lab_"):
+        return any(int(v) in {2, 3} for v in raw_values)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -68,18 +77,26 @@ def select_patients(
     if not label_file.exists():
         raise FileNotFoundError(f"Label file not found: {label_file}")
 
-    # Collect all prediction-event labels per patient
-    patient_labels: dict = defaultdict(list)
+    # Collect all raw label values per patient
+    patient_raw: dict = defaultdict(list)
     with open(label_file) as f:
         for row in csv.DictReader(f):
             pid = int(row["patient_id"])
-            patient_labels[pid].append(_parse_bool(row["value"]))
+            patient_raw[pid].append(row["value"])
 
-    # Stratify by majority label
+    # For lab tasks, exclude patients with any value of 2 or 3
+    n_before = len(patient_raw)
+    patient_raw = {pid: vals for pid, vals in patient_raw.items()
+                   if not _has_ambiguous_labels(task, vals)}
+    n_excluded = n_before - len(patient_raw)
+    if n_excluded:
+        print(f"  Excluded {n_excluded} patients with ambiguous labels (value 2 or 3)")
+
+    # Stratify by task-aware positive definition
     pos_patients = []
     neg_patients = []
-    for pid, vals in patient_labels.items():
-        if _majority_label(vals):
+    for pid, vals in patient_raw.items():
+        if _is_pos_patient(task, vals):
             pos_patients.append(pid)
         else:
             neg_patients.append(pid)
@@ -112,11 +129,11 @@ def select_patients(
 
     selected = []
     for pid in pos_train + neg_train:
-        selected.append({"patient_id": pid, "split": "train"})
+        selected.append({"patient_id": pid, "split": "train", "label": pid in set(pos_train)})
     for pid in pos_val + neg_val:
-        selected.append({"patient_id": pid, "split": "val"})
+        selected.append({"patient_id": pid, "split": "val", "label": pid in set(pos_val)})
     for pid in pos_test + neg_test:
-        selected.append({"patient_id": pid, "split": "test"})
+        selected.append({"patient_id": pid, "split": "test", "label": pid in set(pos_test)})
 
     rng.shuffle(selected)
 
