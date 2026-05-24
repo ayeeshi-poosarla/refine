@@ -60,15 +60,18 @@ def _build_prompt(task_query: str, rubricified_text: str) -> str:
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
-        "torch==2.3.0",
-        "transformers>=4.40.0",
+        "torch==2.5.1",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "transformers>=4.51.0",
         "numpy",
         "scikit-learn",
         "scipy",
         "tqdm",
     )
-    .copy_local_dir(str(REPO_ROOT / "rl"),     "/REFINE/rl")
-    .copy_local_dir(str(REPO_ROOT / "config"), "/REFINE/config")
+    .add_local_dir(str(REPO_ROOT / "rl"),     remote_path="/REFINE/rl")
+    .add_local_dir(str(REPO_ROOT / "config"), remote_path="/REFINE/config")
 )
 
 # ── Modal Volumes ──────────────────────────────────────────────────────────────
@@ -83,13 +86,15 @@ TASKS = ["guo_readmission", "guo_los", "new_lupus", "lab_hyperkalemia"]
 # ── Remote function ────────────────────────────────────────────────────────────
 @app.function(
     image=image,
-    gpu="A100",
+    gpu="A10G",
+    max_containers=4,
     volumes={
         "/cache":   model_cache,
         "/results": results_vol,
     },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=3600,
-    memory=32768,
+    memory=16384,
 )
 def rollout_one(
     task: str,
@@ -147,7 +152,7 @@ def rollout_one(
             MODEL_CACHE, trust_remote_code=True, padding_side="left"
         )
         model = AutoModel.from_pretrained(
-            MODEL_CACHE, trust_remote_code=True, torch_dtype=torch.float16
+            MODEL_CACHE, trust_remote_code=True, dtype=torch.float16
         )
     else:
         print(f"{tag} Downloading {MODEL_NAME} (first run only)")
@@ -155,7 +160,7 @@ def rollout_one(
             MODEL_NAME, trust_remote_code=True, padding_side="left"
         )
         model = AutoModel.from_pretrained(
-            MODEL_NAME, trust_remote_code=True, torch_dtype=torch.float16
+            MODEL_NAME, trust_remote_code=True, dtype=torch.float16
         )
         tokenizer.save_pretrained(MODEL_CACHE)
         model.save_pretrained(MODEL_CACHE)
@@ -332,28 +337,29 @@ def _save_locally(task: str, action_name: str, trajectory: dict) -> None:
 # ── Local entrypoint ───────────────────────────────────────────────────────────
 @app.local_entrypoint()
 def main(
-    tasks:   list[str] = TASKS,
-    actions: list[str] = [],
+    tasks:   str = "",
+    actions: str = "",
 ):
     """
     Launch exhaustive rollout.
 
-    --tasks   : subset of tasks to run (default: all 4 completed tasks)
-    --actions : subset of action names to run (default: all 6 actions)
+    --tasks   : comma-separated task names (default: all 4 completed tasks)
+    --actions : comma-separated action names (default: all 6 actions)
     """
     sys.path.insert(0, str(REPO_ROOT))
     from rl.actions import ALL_ACTIONS
     from config.tasks import TASKS as TASK_QUERIES
 
-    action_names = actions if actions else [a.name for a in ALL_ACTIONS]
+    task_list    = [t.strip() for t in tasks.split(",") if t.strip()] if tasks else TASKS
+    action_names = [a.strip() for a in actions.split(",") if a.strip()] if actions else [a.name for a in ALL_ACTIONS]
 
-    print(f"Tasks   ({len(tasks)}):   {tasks}")
+    print(f"Tasks   ({len(task_list)}):   {task_list}")
     print(f"Actions ({len(action_names)}): {action_names}")
-    print(f"Total jobs: {len(tasks) * len(action_names)}")
+    print(f"Total jobs: {len(task_list) * len(action_names)}")
 
     # Validate tasks have data before submitting
     inputs = []
-    for task in tasks:
+    for task in task_list:
         state_data   = _load_state_data(task)
         base_metrics = _load_base_metrics(task)
         task_query   = TASK_QUERIES.get(task, "")
