@@ -137,7 +137,17 @@ def rollout_one(
         rubric=state_data["rubric"],
         records=state_data["records"],
     )
-    new_state   = action_map[action_name].apply(state)
+    try:
+        new_state   = action_map[action_name].apply(state)
+    except ValueError as e:
+        print(f"{tag} Action not applicable — skipping: {e}")
+        return {
+            "task": task, "action": action_name, "skipped": True,
+            "skip_reason": str(e),
+            "base_test_auroc": base_metrics.get("test_auroc", float("nan")),
+            "new_test_auroc": float("nan"),
+            "delta_auroc": float("nan"),
+        }
     action_meta = new_state.rubric.get("_last_action", {})
     print(f"{tag} Action applied — meta: {json.dumps(action_meta, default=str)}")
 
@@ -377,6 +387,9 @@ def main(
     for traj in sorted(results, key=lambda t: (t["task"], t["action"])):
         task   = traj["task"]
         action = traj["action"]
+        if traj.get("skipped"):
+            print(f"{task:<22} {action:<35} {'SKIP':>6} {'':>6} {traj['skip_reason'][:30]}")
+            continue
         base   = traj["base_test_auroc"]
         new    = traj["new_test_auroc"]
         delta  = traj["delta_auroc"]

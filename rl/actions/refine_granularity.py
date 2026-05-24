@@ -35,10 +35,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after
 from rl.state import RubricState
 
 SPLITS = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 MISSING_VALUES = {"None", "N/A", "No data"}
 
 
@@ -47,7 +47,7 @@ def collect_nonmissing_values(records: dict[str, list[dict]]) -> dict[str, set[s
     field_vals: dict[str, set[str]] = defaultdict(set)
     for recs in records.values():
         for r in recs:
-            for field, value in FIELD_RE.findall(r["rubricified_text"]):
+            for field, value in parse_rubric_fields(r["rubricified_text"]).items():
                 v = value.strip()
                 if v not in MISSING_VALUES:
                     field_vals[field].add(v)
@@ -63,7 +63,7 @@ def compute_entropy(records: dict[str, list[dict]], field: str) -> float:
     counts: dict[str, int] = defaultdict(int)
     for recs in records.values():
         for r in recs:
-            for f, value in FIELD_RE.findall(r["rubricified_text"]):
+            for f, value in parse_rubric_fields(r["rubricified_text"]).items():
                 if f == field:
                     v = value.strip()
                     if v not in MISSING_VALUES:
@@ -91,7 +91,7 @@ def build_value_map(records: dict[str, list[dict]], field: str,
     train_recs = records.get("train") or next(iter(records.values()))
     val_labels: dict[str, list[int]] = defaultdict(list)
     for r in train_recs:
-        for f, value in FIELD_RE.findall(r["rubricified_text"]):
+        for f, value in parse_rubric_fields(r["rubricified_text"]).items():
             if f == field:
                 v = value.strip()
                 if v not in MISSING_VALUES:
@@ -122,21 +122,6 @@ def refine_field_in_rubric(rubric_instructions: str, field: str,
     return pattern.sub(f'*   **{field}:** {description}\n', rubric_instructions, count=1)
 
 
-def refine_field_in_text(rubricified_text: str, field: str,
-                          value_map: dict[str, str]) -> str:
-    """Remap the field's current binary value to its 3-level equivalent."""
-    def replace(m):
-        current = m.group(1).strip()
-        new_val = value_map.get(current, current)
-        return f'*   **{field}:** {new_val}\n'
-
-    pattern = re.compile(
-        r'^\s*\*?\s*\*\*' + re.escape(field) + r':\*\*\s*(.+)\n?',
-        re.MULTILINE,
-    )
-    return pattern.sub(replace, rubricified_text)
-
-
 class RefineGranularity(BaseAction):
     @property
     def name(self) -> str:
@@ -159,8 +144,10 @@ class RefineGranularity(BaseAction):
         )
         for recs in new_state.records.values():
             for r in recs:
-                r["rubricified_text"] = refine_field_in_text(
-                    r["rubricified_text"], target, value_map
+                current_val = parse_rubric_fields(r["rubricified_text"]).get(target, "")
+                new_val = value_map.get(current_val, current_val)
+                r["rubricified_text"] = replace_field_value(
+                    r["rubricified_text"], target, new_val
                 )
 
         new_state.rubric["_last_action"] = {

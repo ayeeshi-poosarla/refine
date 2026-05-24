@@ -33,10 +33,10 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after
 from rl.state import RubricState
 
 SPLITS = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 
 
 def parse_records(records: dict[str, list[dict]]) -> dict[str, list[dict]]:
@@ -46,7 +46,7 @@ def parse_records(records: dict[str, list[dict]]) -> dict[str, list[dict]]:
         parsed[split] = [
             {
                 "label":  int(r["label"]),
-                "fields": dict(FIELD_RE.findall(r["rubricified_text"])),
+                "fields": parse_rubric_fields(r["rubricified_text"]),
             }
             for r in recs
         ]
@@ -118,14 +118,6 @@ def remove_field_from_rubric(rubric_instructions: str, field: str) -> str:
     return pattern.sub("", rubric_instructions)
 
 
-def remove_field_from_text(rubricified_text: str, field: str) -> str:
-    pattern = re.compile(
-        r'^\s*\*?\s*\*\*' + re.escape(field) + r':\*\*[^\n]*\n?',
-        re.MULTILINE,
-    )
-    return pattern.sub("", rubricified_text)
-
-
 class RemoveRedundantPair(BaseAction):
     @property
     def name(self) -> str:
@@ -149,7 +141,7 @@ class RemoveRedundantPair(BaseAction):
         )
         for recs in new_state.records.values():
             for r in recs:
-                r["rubricified_text"] = remove_field_from_text(r["rubricified_text"], to_remove)
+                r["rubricified_text"] = remove_field(r["rubricified_text"], to_remove)
 
         new_state.rubric["_last_action"] = {
             "action":      self.name,

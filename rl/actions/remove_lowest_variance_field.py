@@ -25,10 +25,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after
 from rl.state import RubricState
 
 SPLITS = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 
 
 def compute_unique_counts(rubricified_dir: Path, task: str) -> dict[str, int]:
@@ -38,7 +38,7 @@ def compute_unique_counts(rubricified_dir: Path, task: str) -> dict[str, int]:
         if not path.exists():
             continue
         for record in json.load(open(path)):
-            for field, value in FIELD_RE.findall(record["rubricified_text"]):
+            for field, value in parse_rubric_fields(record["rubricified_text"]).items():
                 field_values[field].add(value.strip())
     return {f: len(v) for f, v in field_values.items()}
 
@@ -57,14 +57,6 @@ def remove_field_from_rubric(rubric_instructions: str, field: str) -> str:
     return pattern.sub("", rubric_instructions)
 
 
-def remove_field_from_text(rubricified_text: str, field: str) -> str:
-    pattern = re.compile(
-        r'^\s*\*?\s*\*\*' + re.escape(field) + r':\*\*[^\n]*\n?',
-        re.MULTILINE,
-    )
-    return pattern.sub("", rubricified_text)
-
-
 class RemoveLowestVarianceField(BaseAction):
     @property
     def name(self) -> str:
@@ -77,7 +69,7 @@ class RemoveLowestVarianceField(BaseAction):
         field_values: dict[str, set] = defaultdict(set)
         for recs in new_state.records.values():
             for r in recs:
-                for field, value in FIELD_RE.findall(r["rubricified_text"]):
+                for field, value in parse_rubric_fields(r["rubricified_text"]).items():
                     field_values[field].add(value.strip())
         unique_counts = {f: len(v) for f, v in field_values.items()}
 
@@ -88,7 +80,7 @@ class RemoveLowestVarianceField(BaseAction):
         )
         for recs in new_state.records.values():
             for r in recs:
-                r["rubricified_text"] = remove_field_from_text(r["rubricified_text"], target)
+                r["rubricified_text"] = remove_field(r["rubricified_text"], target)
 
         new_state.rubric["_last_action"] = {
             "action": self.name,

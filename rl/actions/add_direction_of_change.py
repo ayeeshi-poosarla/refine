@@ -45,10 +45,10 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after
 from rl.state import RubricState
 
 SPLITS = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 NUM_RE   = re.compile(r'-?\d+\.?\d*')
 
 
@@ -64,7 +64,7 @@ def load_records(rubricified_dir: Path, task: str) -> dict[str, list[dict]]:
 def parse_fields(records: list[dict]) -> list[dict]:
     rows = []
     for r in records:
-        fields = dict(FIELD_RE.findall(r["rubricified_text"]))
+        fields = parse_rubric_fields(r["rubricified_text"])
         rows.append({
             "label": int(r["label"]),
             "patient_id": r["patient_id"],
@@ -114,7 +114,7 @@ def compute_directions(split_records: dict[str, list[dict]], field: str) -> dict
     all_events: list[dict] = []
     for records in split_records.values():
         for r in records:
-            fields = dict(FIELD_RE.findall(r["rubricified_text"]))
+            fields = parse_rubric_fields(r["rubricified_text"])
             all_events.append({
                 "patient_id": r["patient_id"],
                 "prediction_time": r["prediction_time"],
@@ -167,16 +167,6 @@ def add_field_to_rubric(rubric_instructions: str, source_field: str,
     return result
 
 
-def add_field_to_text(rubricified_text: str, source_field: str,
-                       new_field: str, direction: str) -> str:
-    pattern = re.compile(
-        r'(^\s*\*?\s*\*\*' + re.escape(source_field) + r':\*\*[^\n]*)',
-        re.MULTILINE,
-    )
-    replacement = r'\1' + f'\n*   **{new_field}:** {direction}'
-    return pattern.sub(replacement, rubricified_text, count=1)
-
-
 class AddDirectionOfChange(BaseAction):
     @property
     def name(self) -> str:
@@ -203,7 +193,7 @@ class AddDirectionOfChange(BaseAction):
             for r in recs:
                 key = (r["patient_id"], r["prediction_time"])
                 direction = directions.get(key, "N/A")
-                r["rubricified_text"] = add_field_to_text(
+                r["rubricified_text"] = add_field_after(
                     r["rubricified_text"], source_field, new_field, direction
                 )
 

@@ -31,10 +31,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after
 from rl.state import RubricState
 
 SPLITS  = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 MISSING_VALUES = {"None", "N/A", "No data"}
 
 
@@ -47,7 +47,7 @@ def compute_missing_rates(rubricified_dir: Path, task: str) -> dict[str, tuple[i
         if not path.exists():
             continue
         for record in json.load(open(path)):
-            for field, value in FIELD_RE.findall(record["rubricified_text"]):
+            for field, value in parse_rubric_fields(record["rubricified_text"]).items():
                 field_total[field] += 1
                 if value.strip() in MISSING_VALUES:
                     field_missing[field] += 1
@@ -72,20 +72,6 @@ def add_field_to_rubric(rubric_instructions: str, source_field: str,
     return pattern.sub(replacement, rubric_instructions, count=1)
 
 
-def add_field_to_text(rubricified_text: str, source_field: str,
-                       new_field: str) -> str:
-    pattern = re.compile(
-        r'(^\s*\*?\s*\*\*' + re.escape(source_field) + r':\*\*\s*)(.+)',
-        re.MULTILINE,
-    )
-    def replace(m):
-        value = m.group(2).strip()
-        indicator = "1" if value in MISSING_VALUES else "0"
-        return m.group(0) + f'\n*   **{new_field}:** {indicator}'
-
-    return pattern.sub(replace, rubricified_text, count=1)
-
-
 class AddMissingnessIndicator(BaseAction):
     @property
     def name(self) -> str:
@@ -99,7 +85,7 @@ class AddMissingnessIndicator(BaseAction):
         field_total:   dict[str, int] = defaultdict(int)
         for recs in new_state.records.values():
             for r in recs:
-                for field, value in FIELD_RE.findall(r["rubricified_text"]):
+                for field, value in parse_rubric_fields(r["rubricified_text"]).items():
                     field_total[field] += 1
                     if value.strip() in MISSING_VALUES:
                         field_missing[field] += 1
@@ -114,8 +100,10 @@ class AddMissingnessIndicator(BaseAction):
         )
         for recs in new_state.records.values():
             for r in recs:
-                r["rubricified_text"] = add_field_to_text(
-                    r["rubricified_text"], source_field, new_field
+                current_val = parse_rubric_fields(r["rubricified_text"]).get(source_field, "")
+                indicator = "1" if current_val.strip() in MISSING_VALUES else "0"
+                r["rubricified_text"] = add_field_after(
+                    r["rubricified_text"], source_field, new_field, indicator
                 )
 
         new_state.rubric["_last_action"] = {

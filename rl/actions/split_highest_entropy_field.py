@@ -34,10 +34,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from rl.base_action import BaseAction
+from rl.parsing import parse_rubric_fields, remove_field, replace_field_value, add_field_after, rename_field
 from rl.state import RubricState
 
 SPLITS = ("train", "val", "test")
-FIELD_RE = re.compile(r'\*\*([A-Z_]+):\*\*\s*(.+)')
 NUM_RE   = re.compile(r'-?\d+\.?\d*')
 
 
@@ -51,7 +51,7 @@ def collect_field_values(records: dict[str, list[dict]]) -> dict[str, list[str]]
     field_vals: dict[str, list[str]] = defaultdict(list)
     for recs in records.values():
         for r in recs:
-            for field, value in FIELD_RE.findall(r["rubricified_text"]):
+            for field, value in parse_rubric_fields(r["rubricified_text"]).items():
                 field_vals[field].append(value.strip())
     return dict(field_vals)
 
@@ -101,15 +101,6 @@ def replace_field_in_rubric(rubric_instructions: str, field: str,
     return pattern.sub(f'*   **{new_field}:** {description}\n', rubric_instructions, count=1)
 
 
-def replace_field_in_text(rubricified_text: str, field: str,
-                           new_field: str, bin_label: str) -> str:
-    pattern = re.compile(
-        r'^\s*\*?\s*\*\*' + re.escape(field) + r':\*\*[^\n]*\n?',
-        re.MULTILINE,
-    )
-    return pattern.sub(f'*   **{new_field}:** {bin_label}\n', rubricified_text, count=1)
-
-
 class SplitHighestEntropyField(BaseAction):
     @property
     def name(self) -> str:
@@ -133,10 +124,10 @@ class SplitHighestEntropyField(BaseAction):
 
         for recs in new_state.records.values():
             for r in recs:
-                fields    = dict(FIELD_RE.findall(r["rubricified_text"]))
+                fields    = parse_rubric_fields(r["rubricified_text"])
                 raw_val   = fields.get(source_field, "").strip()
                 bin_label = bin_map.get(raw_val, "LOW")
-                r["rubricified_text"] = replace_field_in_text(
+                r["rubricified_text"] = rename_field(
                     r["rubricified_text"], source_field, new_field, bin_label
                 )
 
