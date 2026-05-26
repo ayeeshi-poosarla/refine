@@ -37,13 +37,19 @@ class ActionPolicy:
         rewards: dict[str, float],
         lr: float = 0.1,
         eps: float = 1e-8,
+        beta: float = 0.0,
     ) -> dict[str, float]:
         """One GRPO step: group-normalise rewards, then update logits.
 
         Skipped / missing actions contribute NaN rewards.  They are excluded
         from the group mean/std but receive a zero-advantage (no logit change).
 
-        Returns a per-action advantage dict for logging.
+        beta > 0 adds a KL penalty that pulls the policy back toward the uniform
+        reference distribution, preventing premature collapse onto one action:
+            Δ logit_i = lr · (A_i  −  β · ∂KL(π ‖ π_ref)/∂logit_i)
+        where ∂KL/∂logit_i = π_i · (log(π_i / π_ref_i) − KL).
+
+        Returns a per-action advantage dict (before KL subtraction) for logging.
         """
         r = np.array([rewards.get(a, float("nan")) for a in self.action_names])
         valid = ~np.isnan(r)
@@ -54,13 +60,18 @@ class ActionPolicy:
         mu = float(r[valid].mean())
         sigma = float(r[valid].std())
 
-        # A_i = (r_i - μ) / (σ + ε)  for valid actions, 0 for skipped
+        # A_i = (r_i − μ) / (σ + ε)  for valid actions, 0 for skipped
         advantages = np.where(valid, (r - mu) / (sigma + eps), 0.0)
 
-        # Simplified GRPO logit update (equivalent to policy-gradient step
-        # when each action is sampled exactly once and Σ A_i ≈ 0):
-        #   Δ logit_i = lr · A_i
-        self.logits += lr * advantages
+        update = advantages.copy()
+        if beta > 0.0:
+            pi     = self.probabilities()
+            pi_ref = np.ones(len(self.action_names)) / len(self.action_names)
+            kl     = float(np.sum(pi * np.log(pi / pi_ref + 1e-10)))
+            kl_grad = pi * (np.log(pi / pi_ref + 1e-10) - kl)
+            update  = advantages - beta * kl_grad
+
+        self.logits += lr * update
 
         return {a: float(advantages[i]) for i, a in enumerate(self.action_names)}
 
