@@ -398,3 +398,210 @@ def main(
 
     print("=" * 80)
     print(f"\nDone. {len(results)} trajectories saved to data/rl/trajectories/")
+
+
+# ── GRPO training loop ─────────────────────────────────────────────────────────
+# Run with:
+#   modal run rl/exhaustive_rollout.py::train_grpo --task guo_readmission
+#   modal run rl/exhaustive_rollout.py::train_grpo --task guo_readmission --steps 5 --greedy
+
+def _grpo_load_iter0_rewards(task: str, traj_root: Path, all_action_names: list) -> dict:
+    rewards = {}
+    for name in all_action_names:
+        p = traj_root / task / name / "trajectory.json"
+        if not p.exists():
+            continue
+        traj = json.loads(p.read_text())
+        if not traj.get("skipped"):
+            rewards[name] = traj["new_test_auroc"]
+    return rewards
+
+
+def _grpo_run_rollout_step(
+    task: str,
+    task_query: str,
+    state,
+    base_auroc: float,
+    all_actions: list,
+) -> dict:
+    """Dispatch exhaustive rollout on `state` via Modal; return {action: auroc}."""
+    state_data   = {"rubric": state.rubric, "records": state.records}
+    base_metrics = {"test_auroc": base_auroc}
+    inputs = [
+        (task, a.name, task_query, state_data, base_metrics)
+        for a in all_actions
+    ]
+    print(f"  Dispatching {len(inputs)} Modal rollout jobs…")
+    results = list(rollout_one.starmap(inputs))
+    rewards = {}
+    for traj in results:
+        aname = traj["action"]
+        if not traj.get("skipped"):
+            rewards[aname] = traj["new_test_auroc"]
+        else:
+            print(f"    {aname}: SKIPPED — {traj.get('skip_reason', '')}")
+    return rewards
+
+
+def _grpo_apply_with_fallback(chosen: str, state, policy, action_map: dict) -> tuple:
+    """Apply chosen action; fall back by probability rank on ValueError."""
+    import numpy as np
+    probs   = policy.probabilities()
+    ranked  = [policy.action_names[i] for i in np.argsort(-probs)]
+    ordered = [chosen] + [a for a in ranked if a != chosen]
+    for name in ordered:
+        try:
+            new_state = action_map[name].apply(state)
+            if name != chosen:
+                print(f"    Fell back: {chosen} → {name}")
+            return name, new_state
+        except ValueError as e:
+            print(f"    {name} not applicable ({e}), trying next…")
+    raise RuntimeError("No applicable action found for current state.")
+
+
+def _grpo_print_table(policy, rewards: dict, advantages: dict, step: int) -> None:
+    import numpy as np
+    probs = policy.probabilities()
+    print(f"\n  ── Step {step} policy {'─'*38}")
+    print(f"  {'ACTION':<35} {'REWARD':>7} {'ADV':>8} {'PROB':>6} {'LOGIT':>8}")
+    print(f"  {'-'*35} {'-'*7} {'-'*8} {'-'*6} {'-'*8}")
+    for i, name in enumerate(policy.action_names):
+        r   = rewards.get(name, float("nan"))
+        adv = advantages.get(name, 0.0)
+        p   = float(probs[i])
+        l   = float(policy.logits[i])
+        r_s   = f"{r:.4f}"    if not np.isnan(r)  else "  skip"
+        adv_s = f"{adv:+.4f}" if advantages        else "       "
+        print(f"  {name:<35} {r_s:>7} {adv_s:>8} {p:>6.3f} {l:>8.4f}")
+    print()
+
+
+@app.local_entrypoint()
+def train_grpo(
+    task:   str   = "guo_readmission",
+    steps:  int   = 5,
+    lr:     float = 0.1,
+    greedy: bool  = False,
+    seed:   int   = 42,
+) -> None:
+    """
+    GRPO training loop (T steps) for a single task.
+
+    --task   : EHRSHOT task name  (default: guo_readmission)
+    --steps  : RL steps after the initial policy update  (default: 5)
+    --lr     : GRPO learning rate  (default: 0.1)
+    --greedy : deterministic action selection (argmax); default is stochastic
+    --seed   : RNG seed for stochastic sampling  (default: 42)
+    """
+    import numpy as np
+    sys.path.insert(0, str(REPO_ROOT))
+
+    from config.tasks import TASKS as TASK_QUERIES
+    from rl.actions import ALL_ACTIONS
+    from rl.policy import ActionPolicy
+    from rl.state import RubricState
+
+    task_query   = TASK_QUERIES.get(task, "")
+    action_map   = {a.name: a for a in ALL_ACTIONS}
+    action_names = [a.name for a in ALL_ACTIONS]
+    traj_root    = REPO_ROOT / "data" / "rl" / "trajectories"
+    policy_dir   = REPO_ROOT / "data" / "rl" / "policies"
+    log_dir      = REPO_ROOT / "data" / "rl" / "training_log"
+    rng          = np.random.RandomState(seed)
+
+    print(f"\n{'='*62}")
+    print(f" GRPO Training — task={task}  steps={steps}  lr={lr}  greedy={greedy}")
+    print(f"{'='*62}")
+
+    # ── Step 0: policy from iteration-0 rewards ────────────────────────────────
+    print("\n[Step 0]  Loading iteration-0 exhaustive rollout rewards…")
+    rewards_0 = _grpo_load_iter0_rewards(task, traj_root, action_names)
+
+    if len(rewards_0) < 2:
+        raise RuntimeError(
+            f"Need ≥ 2 iter-0 rewards for {task!r}, found {len(rewards_0)}.\n"
+            f"Run `modal run rl/exhaustive_rollout.py --tasks {task}` first."
+        )
+
+    policy = ActionPolicy(action_names)
+    adv_0  = policy.grpo_update(rewards_0, lr=lr)
+    _grpo_print_table(policy, rewards_0, adv_0, step=0)
+    policy.save(policy_dir / task / "policy_step_0.json")
+    print(f"  Best action after step 0: {policy.best_action()}")
+
+    # Load initial state and base AUROC
+    state = RubricState.from_disk(
+        task,
+        rubric_dir=REPO_ROOT / "data" / "rubric",
+        rubricified_dir=REPO_ROOT / "data" / "rubric" / "rubricified",
+    )
+    base_metrics_path = REPO_ROOT / "data" / "results" / "global-rubric" / task / "metrics.json"
+    state_auroc = (
+        json.loads(base_metrics_path.read_text()).get("test_auroc", float("nan"))
+        if base_metrics_path.exists() else float("nan")
+    )
+
+    log = {
+        "task": task, "steps": steps, "lr": lr, "greedy": greedy, "seed": seed,
+        "history": [{
+            "step": 0, "action_selected": None,
+            "state_auroc": state_auroc,
+            "rewards": rewards_0, "advantages": adv_0,
+            "policy": policy.to_dict(),
+        }],
+    }
+
+    prev_rewards = rewards_0   # rewards for actions on the current state
+
+    # ── Training loop ──────────────────────────────────────────────────────────
+    for t in range(1, steps + 1):
+        print(f"\n[Step {t}/{steps}]")
+
+        # a. Select action
+        chosen = policy.best_action() if greedy else policy.sample(rng)
+        probs  = policy.probabilities()
+        print(f"  Selected : {chosen}")
+        print(f"  Probs    : " + "  ".join(
+            f"{n[:8]}={probs[i]:.3f}" for i, n in enumerate(action_names)
+        ))
+
+        # b. Apply action (pure Python, no GPU)
+        chosen, state = _grpo_apply_with_fallback(chosen, state, policy, action_map)
+        state_auroc = prev_rewards.get(chosen, state_auroc)
+        print(f"  State AUROC after action: {state_auroc:.4f}")
+
+        # c. Exhaustive mini-rollout on new state via Modal (rollout_one is in this app)
+        rewards_t = _grpo_run_rollout_step(task, task_query, state, state_auroc, ALL_ACTIONS)
+
+        # d. GRPO update
+        adv_t = policy.grpo_update(rewards_t, lr=lr)
+        _grpo_print_table(policy, rewards_t, adv_t, step=t)
+        policy.save(policy_dir / task / f"policy_step_{t}.json")
+
+        log["history"].append({
+            "step": t, "action_selected": chosen,
+            "state_auroc": state_auroc,
+            "rewards": rewards_t, "advantages": adv_t,
+            "policy": policy.to_dict(),
+        })
+
+        prev_rewards = rewards_t
+
+    # ── Save log ───────────────────────────────────────────────────────────────
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task}.json"
+    log_path.write_text(json.dumps(log, indent=2))
+    print(f"\nTraining log → {log_path}")
+
+    # ── Final summary ──────────────────────────────────────────────────────────
+    print(f"\n{'='*62}")
+    print(f" Final policy — {steps} RL steps")
+    _grpo_print_table(policy, {}, {}, step=steps)
+    print("  AUROC progression:")
+    for entry in log["history"]:
+        s   = entry["step"]
+        act = entry["action_selected"] or "—"
+        auc = entry["state_auroc"]
+        print(f"    step {s:2d}  {act:<35}  {auc:.4f}")
+    print(f"{'='*62}\n")
