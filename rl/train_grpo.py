@@ -204,6 +204,12 @@ def _run_one_task(
     best_state   = state       # best-state: highest-AUROC rubric seen
     best_auroc   = state_auroc # best-state: high-water mark
 
+    # ── Early-stopping bookkeeping ─────────────────────────────────────────
+    _PATIENCE           = 3
+    _MIN_DELTA          = 0.01
+    no_improve_streak   = 0
+    prev_tracked_auroc  = best_auroc if best_state_rollout else state_auroc
+
     # ── Training loop ──────────────────────────────────────────────────────
     for t in range(1, steps + 1):
         print(f"\n[Step {t}/{steps}]")
@@ -272,6 +278,21 @@ def _run_one_task(
                 "policy": policy.to_dict(),
             })
             prev_rewards = rewards_t
+
+        # ── Early stopping (shared by both modes) ──────────────────────────
+        tracked_auroc = best_auroc if best_state_rollout else state_auroc
+        improvement   = tracked_auroc - prev_tracked_auroc
+        if improvement < _MIN_DELTA:
+            no_improve_streak += 1
+            print(f"  Δ AUROC = {improvement:+.4f}  (streak {no_improve_streak}/{_PATIENCE})")
+            if no_improve_streak >= _PATIENCE:
+                print(f"  ── Early stop: < {_MIN_DELTA} improvement for {_PATIENCE} consecutive steps.")
+                log["stopped_early"]   = True
+                log["stopped_at_step"] = t
+                break
+        else:
+            no_improve_streak = 0
+        prev_tracked_auroc = tracked_auroc
 
     # ── Save log ───────────────────────────────────────────────────────────
     LOG_DIR.mkdir(parents=True, exist_ok=True)
